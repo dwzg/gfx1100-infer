@@ -4,9 +4,12 @@ A from-scratch LLM inference engine for the AMD Radeon RX 7900 XTX (Navi 31, `gf
 built on Vulkan compute. No ROCm, no llama.cpp, no ML framework: it reads GGUF files directly
 and runs the model with its own compute kernels.
 
-**Status: the engine is functionally complete for token-by-token generation and verified for
-correctness, but it has not yet run on a 7900 XTX.** Everything here was developed in a
-container without a GPU. Nothing in this repository is a measured 7900 XTX speed.
+It includes a server that speaks the Anthropic Messages API, so
+[Claude Code](#claude-code) can use a local model as its backend.
+
+**Status: the engine and the server are functionally complete and verified for correctness, but
+nothing has run on a 7900 XTX yet.** Everything here was developed in a container without a GPU.
+Nothing in this repository is a measured 7900 XTX speed.
 
 ## What works
 
@@ -23,6 +26,8 @@ container without a GPU. Nothing in this repository is a measured 7900 XTX speed
 | Batched prompt processing | Yes: prompt tokens go through in batches (default 32) with weights decoded once per 4-token tile |
 | Matrix instructions (WMMA) for prompts | Written and compiled for the card, **never executed**; enabled per weight format only if an automatic on-device check passes |
 | Interactive chat | `gfxi chat`, ChatML-style templates only, with `--system` and `--no-think` |
+| Messages API server (`gfxi serve`) | Streaming, tool calls, reasoning blocks, token counting; drives the real Claude Code CLI end to end (on a CPU driver, with a small model) |
+| Reuse of processed context between requests | Several conversations share the context memory; a request only pays for what no earlier one has processed |
 | Images, chat templates other than ChatML, YaRN context extension, SentencePiece vocabularies | Not yet |
 
 ## Build
@@ -45,6 +50,7 @@ build/gfxi devices                          # which device, and which hardware f
 build/gfxi plan  model.gguf --vram 24       # GPU memory needed and how much context fits
 build/gfxi run   model.gguf --chat -p "Why is the sky blue?" -n 200
 build/gfxi chat  model.gguf --kv8 --ctx max                 # interactive, context kept between turns
+build/gfxi serve model.gguf --kv8 --ctx max                 # Messages API server, e.g. for Claude Code
 build/gfxi run   model.gguf --kv8 --ctx max -p @long_prompt.txt --save-state doc.ctx   # process once
 build/gfxi run   model.gguf --kv8 --load-state doc.ctx --chat -p "Summarise it."         # reuse
 build/gfxi bench                            # memory roofline, kernel throughput, dispatch cost
@@ -55,6 +61,73 @@ build/gfxi kernels matvec_q4_k --code       # the machine code the driver genera
 
 `run` defaults to greedy decoding; add `--temp 0.7 --top-k 20 --top-p 0.8` to sample.
 `--device cpu` uses the slow scalar reference path. `GFX_DEVICE=<index|name>` picks a Vulkan device.
+
+### Claude Code
+
+`gfxi serve` makes the model available over the Anthropic Messages API, which is what Claude Code
+speaks. Start the server, then start Claude Code with the settings the server prints:
+
+```sh
+build/gfxi serve Qwen3.8-27B-UD-Q4_K_S.gguf --kv8 --ctx max        # listens on 127.0.0.1:8080
+
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_AUTH_TOKEN=local                       # any text, unless the server has --api-key
+export ANTHROPIC_MODEL=Qwen3.8-27B-UD-Q4_K_S            # the name the server reports (--model-id)
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_MODEL   # background requests (titles, summaries)
+export CLAUDE_CODE_SUBAGENT_MODEL=$ANTHROPIC_MODEL
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=229376            # printed by the server for its context size
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+claude
+```
+
+The same variables can go in the `env` block of `~/.claude/settings.json`. Claude Code does not
+know the model, so without `CLAUDE_CODE_MAX_CONTEXT_TOKENS` it assumes a window of a million
+tokens; with it, it compacts the conversation before the server's context is full. Anthropic does
+not support Claude Code with models other than Claude: expect it to work as well as the model
+follows a long system prompt and calls tools reliably, which is the model's doing, not the server's.
+
+What the server does with a request:
+
+- **Formats it as the model was trained.** The system prompt, tool definitions, tool calls, tool
+  results and reasoning are written in the model's own chat format (read from the template in the
+  model file; ChatML with tool calls as `<function=...>` blocks, as Qwen 3.5 and later use, or as
+  JSON, as Qwen 3 and Hermes-style models use). The reply is split back into `thinking`, `text`
+  and `tool_use` blocks and streamed as it is generated. Text that comes from outside (file
+  contents, tool results, the user's messages) is never read as markup: a file containing
+  `<|im_end|>` cannot end a message.
+- **Processes each token of a conversation once.** Claude Code resends the whole conversation with
+  every request. The server keeps what it has processed on the GPU and only runs the new part: in
+  the test run below, the second request of a tool loop reused 1,570 of 1,599 prompt tokens.
+  `usage` reports reused tokens as `cache_read_input_tokens`.
+- **Keeps several conversations at once.** The main conversation, background requests (titles,
+  summaries) and subagents each keep their place; the context memory is handed out to them in
+  pages of 1,024 tokens, and conversations with the same beginning (two subagents with the same
+  instructions, a conversation and a side question about it) share the pages of that beginning.
+  When the memory runs out, conversations idle for an hour go first, then the cheapest to redo.
+- **Keeps reasoning in the conversation.** Earlier reasoning stays in the prompt (as Qwen 3.8's
+  template does by default), so the conversation only ever grows at its end. `--drop-thinking`
+  follows templates that drop it instead, at the cost of reprocessing each turn.
+
+Options: `--think auto|on|off` (default: reason when the request enables thinking, which Claude
+Code does), `--effort low|medium|high` (overrides the request; Qwen 3.8's template has effort
+levels), `--temp/--top-k/--top-p` (defaults 0.6 / 20 / 0.95; the request's own sampling settings
+are ignored unless `--client-sampling`), `--host`, `--port`, `--api-key`, `--model-id`,
+`--conversations N`, `--checkpoints N`, `--log-prompts`, `--dump-requests DIR`.
+
+Limits to know about:
+
+- One request generates at a time; others wait their turn (they are kept alive with pings).
+- The context is shared by all conversations the server keeps, which is why the window given to
+  Claude Code above is smaller than the server's context.
+- Qwen 3.5 and later mix attention with linear-attention layers, whose state cannot be rewound.
+  The server keeps copies of that state at useful points (the end of the tool list, the end of the
+  system prompt, the end of each request); a request that diverges from a conversation elsewhere
+  reprocesses from the nearest earlier copy. For Qwen 3.8 27B a copy is about 150 MiB of main
+  memory, and up to 8 conversations x 5 copies are kept (`--conversations`, `--checkpoints`).
+- Not implemented: images and documents (replaced by a placeholder), structured-output schemas
+  (not enforced), server-side tools such as web search (ignored), `tool_choice` beyond forcing a
+  call, and saving the processed system prompt across server restarts (the first request after a
+  start processes Claude Code's whole system prompt and tool list, about 12,000-25,000 tokens).
 
 ### Getting the most context out of 24 GB
 
@@ -122,6 +195,12 @@ weight exactly once per token, as cheaply as possible:
   weights, so scoring is the same kernel shape with one lane per cached position, and all query
   heads that share a key head are scored in one pass. Value sums run over 1024-position segments
   in parallel. Dispatch sizes follow the filled context through indirect dispatch.
+- *The attention cache is paged.* It is divided into pages of 1,024 positions, and the three
+  kernels that touch it go through a page table (one extra scalar load per workgroup). A token
+  stream owns a list of pages, so several conversations share the memory, a conversation can
+  branch off another by sharing its pages (a shared page is copied when written to), and nothing
+  is ever moved. The linear-attention state lives outside the cache and is copied to main memory
+  where a conversation may later be resumed (`src/engine/context.h`).
 
 **Correctness first.** `src/core/ref.cpp` is a plain scalar implementation of the forward pass.
 The GPU engine is checked against it logit by logit, and it is itself checked by generating
@@ -143,6 +222,11 @@ What was checked, and how:
 | Batched and emulated matrix-path kernels, all 14 native formats, on real weight samples | Scalar decoder | Relative error about 3e-7 (batched) and 3e-4 (half-precision matrix path) |
 | 8-bit cache | CPU reference | Relative logit error 0.4-0.9% on Qwen 3.5 0.8B; 1-2% on a 135M Llama-style model |
 | Every kernel compiles for the 7900 XTX, including the matrix-instruction ones | RADV 25.2.8 as Navi 31 (no hardware) | All 74 compile, no vector-register spills; the matrix kernels contain `v_wmma_f32_16x16x16_f16` |
+| Paged cache with small pages handed out in reverse order, half-precision and 8-bit | CPU reference | Same errors as unpaged |
+| Conversation cache: continuing, branching, returning, same prompt again, eviction (Qwen 3.5 with both cache types, Qwen 3) | Processing the same prompt from scratch | Bit-identical logits |
+| Prompt formatting: 86 prompts with system text, tools, calls, results, reasoning and effort levels, on the templates of Qwen 3.8, 3.5, 3, 2.5 and SmolLM2 | The model's own template, run with jinja2 | Byte-identical |
+| Reply parser: 14 replies, each fed in pieces of 1, 2, 3, 7, 64 bytes and whole | Expected blocks; events add up to the blocks; parsed and written back gives the original text | All pass |
+| Server protocol: streaming, forced tool call, tool result, reuse across turns and across a side request, cancel, stop sequence, errors | Official `anthropic` Python SDK 2.14 as the client | All pass; a follow-up turn reused 432 of 432 earlier tokens |
 
 Not checked:
 
@@ -181,17 +265,21 @@ In order:
    waves, tokens per tile, a faster codebook lookup for IQ4 and NVFP4 (those kernels currently do
    about 3x the arithmetic of Q4_K per weight), and folding the half-precision conversion into the
    kernels that produce each vector.
-4. The Inkling 2 Mini architecture.
+4. Claude Code against the real model: `gfxi serve` with Qwen 3.8 27B, then a session with the
+   settings it prints. Watch the server's log lines (tokens reused, processed, tokens per second)
+   and how well the model handles Claude Code's tool calls.
+5. The Inkling 2 Mini architecture.
 
 ## Layout
 
 ```
 src/core/     GGUF reader, weight decoders, tokenizer, model description, CPU reference, sampler
 src/vk/       Vulkan device, memory, pipelines, recorded programs
-src/engine/   GPU weight layouts and the GPU engine
+src/engine/   GPU weight layouts, the GPU engine, the conversation cache
 src/shaders/  compute kernels (GLSL)
+src/server/   Messages API server: prompt formatting, reply parsing, HTTP
 src/tools/    gfxi command line
-tests/        decoder, tokenizer and end-to-end tests
+tests/        decoder, tokenizer, chat-format, server and end-to-end tests
 ```
 
 `src/core/iq3s_grid.inc` is the IQ3_S codebook, a constant of that GGUF format, with values taken

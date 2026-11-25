@@ -21,8 +21,12 @@
 #include "core/ref.h"
 #include "core/sampler.h"
 #include "core/unicode.h"
+#include "engine/context.h"
 #include "engine/gpu_model.h"
 #include "engine/pack.h"
+#include "server/prompt.h"
+#include "server/reply.h"
+#include "server/server.h"
 #include "vk/vk.h"
 #include "core/tokenizer.h"
 
@@ -401,6 +405,212 @@ static int cmd_compare(int argc, char **argv) {
     return ok ? 0 : 1;
 }
 
+// Conversation cache self-test: a series of prompts that continue, branch off, return to and
+// crowd out each other, each checked against processing the same prompt from scratch.
+static int cmd_test_context(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "usage: gfxi test-context <model.gguf> [--device name] [--kv8] [--ctx N] [--tol T]\n"); return 2; }
+    std::string device; bool kv8 = false; int n_ctx = 1024; double tol = 2e-3;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
+        if (a == "--device") device = next();
+        else if (a == "--kv8") kv8 = true;
+        else if (a == "--ctx") n_ctx = atoi(next());
+        else if (a == "--tol") tol = atof(next());
+        else throw std::runtime_error("unknown option " + a);
+    }
+    GGUF g; g.open(argv[0]);
+    ModelDesc desc = describe_model(g);
+    Tokenizer tok(g);
+    Device dev(device);
+    setenv("GFX_PAGE", "64", 0);   // small pages, so that this short test crosses many of them
+    GpuModel plain(dev, g, desc, n_ctx, false, kv8, 256ull << 20, 8), cached(dev, g, desc, n_ctx, false, kv8, 256ull << 20, 8);
+    ContextCache::Options opt; opt.min_gap = 24; opt.leave_gap = 24; opt.max_checkpoints = 2; opt.max_conversations = 3;
+    ContextCache cc(cached, opt);
+    printf("model %s on %s, %s cache, %d pages of %d positions, linear-attention state: %s\n", desc.name.c_str(), dev.caps().name.c_str(), kv8 ? "8-bit" : "half-precision",
+           cached.pages_total(), cached.page_size(), cached.has_recurrent_state() ? "yes" : "no");
+
+    auto enc = [&](const std::string &t) { return tok.encode(t, false, true); };
+    auto cat = [](std::vector<int32_t> a, const std::vector<int32_t> &b) { a.insert(a.end(), b.begin(), b.end()); return a; };
+    const std::vector<int32_t> sys = enc("<|im_start|>system\nYou are a careful assistant. Answer briefly, name your sources, and say so when you are not sure. "
+                                         "The user works on graphics drivers, compilers and numerical code, mostly in C++ and Rust, and prefers plain technical language.<|im_end|>\n");
+    const std::vector<int32_t> a1 = cat(sys, enc("<|im_start|>user\nWhy is the sky blue during the day but red at sunset? Explain the physics in a few sentences, "
+                                                 "and mention which wavelengths are scattered the most and why the path length through the air matters.<|im_end|>\n<|im_start|>assistant\n"));
+    const std::vector<int32_t> a2 = cat(a1, enc("Shorter wavelengths scatter more strongly off air molecules, so blue light reaches the eye from all directions.<|im_end|>\n"
+                                                "<|im_start|>user\nAnd why are clouds white, when they are made of the same water that makes the sea look blue?<|im_end|>\n<|im_start|>assistant\n"));
+    const std::vector<int32_t> a3 = cat(a2, enc("Cloud droplets are much larger than the wavelength of light, so they scatter all colours about equally.<|im_end|>\n<|im_start|>user\nThanks. One more: why is the "
+                                                "night sky dark if there are so many stars in every direction?<|im_end|>\n<|im_start|>assistant\n"));
+    const std::vector<int32_t> side = cat(a2, enc("Clouds scatter all colours alike.<|im_end|>\n<|im_start|>user\nSuggest a short title for this conversation.<|im_end|>\n<|im_start|>assistant\n"));
+    const std::vector<int32_t> b1 = cat(sys, enc("<|im_start|>user\nList the files in the current directory and tell me which of them were changed today, newest first.<|im_end|>\n<|im_start|>assistant\n"));
+    const std::vector<int32_t> c1 = enc("<|im_start|>user\nWrite a haiku about the first snow of the winter falling on a quiet harbour town at dawn, and then explain the image you chose.<|im_end|>\n<|im_start|>assistant\n");
+    std::vector<int32_t> a_long = a3;
+    while ((int)a_long.size() < n_ctx - 90) a_long = cat(a_long, enc("The quick brown fox jumps over the lazy dog, again and again, while the rain keeps falling on the old tin roof. "));
+    const int sys_end = (int)sys.size();
+
+    int failed = 0;
+    auto check = [&](const char *what, const std::vector<int32_t> &prompt, int expect_min_reuse, int n_push, int expect_max_reuse = 1 << 30) {
+        ContextCache::Result r = cc.prepare(prompt, {sys_end});
+        std::vector<float> got = cc.logits();
+        plain.reset();
+        std::vector<float> want = plain.eval(prompt.data(), (int)prompt.size());
+        double worst = 0; bool same_top = true;
+        auto compare = [&] {
+            double num = 0, den = 0;
+            for (size_t i = 0; i < want.size(); i++) { double d = (double)got[i] - want[i]; num += d * d; den += (double)want[i] * want[i]; }
+            worst = std::max(worst, std::sqrt(num / std::max(den, 1e-30)));
+            same_top &= std::max_element(got.begin(), got.end()) - got.begin() == std::max_element(want.begin(), want.end()) - want.begin();
+        };
+        compare();
+        for (int i = 0; i < n_push; i++) {
+            int32_t t = (int32_t)(std::max_element(want.begin(), want.end()) - want.begin());
+            if (!cc.push(t)) throw std::runtime_error("push failed");
+            got = cc.logits(); want = plain.eval(&t, 1);
+            compare();
+        }
+        const bool ok = worst <= tol && same_top && r.reused >= expect_min_reuse && r.reused <= expect_max_reuse && r.reused + r.evaluated == (int)prompt.size();
+        printf("  %-52s %4zu tokens, %4d reused, %4d processed, error %.1e  %s   [%s, %d checkpoints]\n", what, prompt.size(), r.reused, r.evaluated, worst, ok ? "ok" : "FAILED",
+               cc.summary().c_str(), cc.checkpoints());
+        failed += !ok;
+    };
+    const bool rec = cached.has_recurrent_state();
+    check("first conversation", a1, 0, 3);
+    check("its next turn (generated text replaced)", a2, sys_end, 2);
+    check("side request branching off the last turn", side, sys_end, 2);
+    check("the conversation continues without the side request", a3, rec ? sys_end : (int)a2.size() - 1, 2);
+    check("second conversation with the same system prompt", b1, sys_end, 2);
+    check("unrelated conversation", c1, 0, 2);
+    check("back to the first conversation", a3, sys_end, 1);
+    check("the same prompt again", a3, rec ? sys_end : (int)a3.size() - 1, 0);
+    check("a prompt that needs most of the context", a_long, sys_end, 2);
+    int shared = 0;   // what it has in common with the conversation that is still there
+    while (shared < (int)b1.size() && b1[shared] == a1[shared]) shared++;
+    check("second conversation after being crowded out", b1, 0, 1, rec ? sys_end : shared);
+    printf("%s\n", failed ? "FAIL" : "PASS");
+    return failed ? 1 : 0;
+}
+
+// Messages API server (for Claude Code and other clients of that API).
+static int cmd_serve(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "usage: gfxi serve <model.gguf> [--host 127.0.0.1] [--port 8080] [--api-key KEY] [--model-id NAME]\n"
+                        "                  [--ctx N|max] [--reserve GiB] [--kv8] [--batch N] [--device name]\n"
+                        "                  [--think auto|on|off] [--effort low|medium|high] [--drop-thinking]\n"
+                        "                  [--temp T] [--top-k K] [--top-p P] [--client-sampling]\n"
+                        "                  [--conversations N] [--checkpoints N] [--log-prompts] [--dump-requests DIR]\n");
+        return 2;
+    }
+    ServerOptions so; so.sampling.temperature = 0.6f; so.sampling.top_k = 20; so.sampling.top_p = 0.95f;
+    std::string device; int n_ctx = 0, batch = 32; bool kv8 = false; double reserve_gib = 0.25;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
+        if (a == "--host") so.host = next();
+        else if (a == "--port") so.port = atoi(next());
+        else if (a == "--api-key") so.api_key = next();
+        else if (a == "--model-id") so.model_id = next();
+        else if (a == "--ctx") { std::string v = next(); n_ctx = v == "max" ? 0 : atoi(v.c_str()); }
+        else if (a == "--reserve") reserve_gib = atof(next());
+        else if (a == "--kv8") kv8 = true;
+        else if (a == "--batch") batch = atoi(next());
+        else if (a == "--device") device = next();
+        else if (a == "--think") { so.think = next(); if (so.think != "auto" && so.think != "on" && so.think != "off") throw std::runtime_error("--think takes auto, on or off"); }
+        else if (a == "--effort") { so.effort = next(); if (so.effort != "low" && so.effort != "medium" && so.effort != "high") throw std::runtime_error("--effort takes low, medium or high"); }
+        else if (a == "--drop-thinking") so.keep_thinking = false;
+        else if (a == "--temp") so.sampling.temperature = (float)atof(next());
+        else if (a == "--top-k") so.sampling.top_k = atoi(next());
+        else if (a == "--top-p") so.sampling.top_p = (float)atof(next());
+        else if (a == "--client-sampling") so.client_sampling = true;
+        else if (a == "--conversations") so.cache.max_conversations = std::max(1, atoi(next()));
+        else if (a == "--checkpoints") so.cache.max_checkpoints = std::max(1, atoi(next()));
+        else if (a == "--log-prompts") so.log_prompts = true;
+        else if (a == "--dump-requests") so.dump_dir = next();
+        else throw std::runtime_error("unknown option " + a);
+    }
+    GGUF g; g.open(argv[0]);
+    ModelDesc desc = describe_model(g);
+    Tokenizer tok(g);
+    ChatTemplate tmpl = ChatTemplate::detect(g);
+    if (!tmpl.supported) throw std::runtime_error("cannot serve this model: " + tmpl.problem);
+    if (so.model_id == "local") {
+        std::string path = argv[0];
+        size_t slash = path.find_last_of('/'), dot = path.rfind(".gguf");
+        so.model_id = path.substr(slash == std::string::npos ? 0 : slash + 1, dot == std::string::npos ? std::string::npos : dot - (slash == std::string::npos ? 0 : slash + 1));
+    }
+    Device dev(device);
+    fprintf(stderr, "[%s] loading %s ...\n", dev.caps().name.c_str(), desc.name.c_str());
+    GpuModel gpu(dev, g, desc, n_ctx, false, kv8, (uint64_t)(reserve_gib * 1073741824.0), batch);
+    if (dev.caps().coop_matrix) fprintf(stderr, "[matrix instructions verified for: %s]\n", gpu.wmma_report().empty() ? "(disabled)" : gpu.wmma_report().c_str());
+    fprintf(stderr, "[%s] weights %.2f GiB, context %d tokens in %d pages (%s cache, %.2f GiB)\n", dev.caps().name.c_str(), gpu.weight_bytes() / 1073741824.0, gpu.n_ctx(), gpu.pages_total(),
+            kv8 ? "8-bit" : "half-precision", gpu.state_bytes() / 1073741824.0);
+    fprintf(stderr, "[chat format: %s]\n", tmpl.describe().c_str());
+    if (gpu.has_recurrent_state())
+        fprintf(stderr, "[each checkpoint of the linear-attention state takes %.0f MiB of main memory; up to %d conversations with %d checkpoints each are kept]\n", gpu.state_size() / 1048576.0,
+                so.cache.max_conversations, so.cache.max_checkpoints + 2);
+    // The context is shared by every conversation the server keeps (the main one, side requests,
+    // subagents), so the window announced to the client leaves some of it free.
+    const int window = gpu.n_ctx() - std::max(std::min(16384, gpu.n_ctx() / 4), gpu.n_ctx() / 8);
+    fprintf(stderr, "\nTo use this server from Claude Code, start it with these settings (in the shell, or in the \"env\" block of ~/.claude/settings.json):\n"
+                    "  ANTHROPIC_BASE_URL=http://%s:%d\n  ANTHROPIC_AUTH_TOKEN=%s\n  ANTHROPIC_MODEL=%s\n  ANTHROPIC_DEFAULT_HAIKU_MODEL=%s\n  CLAUDE_CODE_SUBAGENT_MODEL=%s\n"
+                    "  CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d\n  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\n\n",
+            so.host == "0.0.0.0" || so.host == "::" ? "127.0.0.1" : so.host.c_str(), so.port, so.api_key.empty() ? "local" : "<the --api-key value>", so.model_id.c_str(), so.model_id.c_str(),
+            so.model_id.c_str(), window);
+    return serve(gpu, tok, tmpl, so);
+}
+
+// Print the prompt a Messages API request turns into (for checking the chat formatting).
+static int cmd_render(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: gfxi render <model.gguf> <request.json> [--think] [--effort E] [--drop-thinking] [--tokens]\n"); return 2; }
+    RenderOptions ro; bool tokens = false;
+    for (int i = 2; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--think") ro.thinking = true;
+        else if (a == "--effort" && i + 1 < argc) ro.effort = argv[++i];
+        else if (a == "--drop-thinking") ro.keep_thinking = false;
+        else if (a == "--tokens") tokens = true;
+        else throw std::runtime_error("unknown option " + a);
+    }
+    GGUF g; g.open(argv[0], true);
+    ChatTemplate tmpl = ChatTemplate::detect(g);
+    if (!tmpl.supported) throw std::runtime_error(tmpl.problem);
+    Json req = Json::parse(read_arg_text((std::string("@") + argv[1]).c_str()));
+    Prompt p = render_prompt(tmpl, req, ro);
+    if (!tokens) { std::string t = p.text(); fwrite(t.data(), 1, t.size(), stdout); return 0; }
+    Tokenizer tok(g);
+    MarkedText all;
+    for (const Prompt::Piece &piece : p.pieces) all.append(piece.text);
+    all.append(p.reply_prefix);
+    for (int32_t id : tok.encode(all.s, false, true, &all.literal)) printf("%d\n", id);
+    return 0;
+}
+
+// Feed text to the reply parser in pieces of the given size and print the events (for tests).
+static int cmd_parse_reply(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: gfxi parse-reply <model.gguf> <request.json> <reply.txt> [--chunk N] [--reasoning] [--cut]\n"); return 2; }
+    size_t chunk = 7; bool reasoning = false, cut = false;
+    for (int i = 3; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--chunk" && i + 1 < argc) chunk = (size_t)atoi(argv[++i]);
+        else if (a == "--reasoning") reasoning = true;
+        else if (a == "--cut") cut = true;
+        else throw std::runtime_error("unknown option " + a);
+    }
+    GGUF g; g.open(argv[0], true);
+    ChatTemplate tmpl = ChatTemplate::detect(g);
+    Json req = Json::parse(read_arg_text((std::string("@") + argv[1]).c_str()));
+    std::string text = read_arg_text((std::string("@") + argv[2]).c_str());
+    std::vector<std::string> stops;
+    for (const Json &s : req["stop_sequences"].items()) stops.push_back(s.str());
+    ReplyParser parser(tmpl, req["tools"], reasoning, stops);
+    std::vector<ReplyEvent> ev;
+    for (size_t i = 0; i < text.size() && !parser.stopped(); i += chunk) parser.feed(std::string_view(text).substr(i, chunk), ev);
+    parser.finish(!cut, ev);
+    static const char *names[] = {"thinking_start", "thinking_delta", "text_start", "text_delta", "tool_start", "tool_delta", "stop"};
+    Json list = Json::array();
+    for (const ReplyEvent &e : ev) list.push(Json::object().set("event", names[e.kind]).set("text", e.text));
+    printf("%s\n", Json::object().set("events", list).set("blocks", parser.blocks()).set("stopped", parser.stopped()).set("body", render_assistant_body(tmpl, parser.blocks(), true).s).dump().c_str());
+    return 0;
+}
+
 static int cmd_devices() {
     auto names = Device::list_devices();
     if (names.empty()) { printf("no Vulkan devices found\n"); return 1; }
@@ -629,6 +839,10 @@ int main(int argc, char **argv) {
         if (argc >= 2 && !strcmp(argv[1], "run")) return cmd_run(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "chat")) return cmd_chat(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "compare")) return cmd_compare(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "test-context")) return cmd_test_context(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "serve")) return cmd_serve(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "render")) return cmd_render(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "parse-reply")) return cmd_parse_reply(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "devices")) return cmd_devices();
         if (argc >= 2 && !strcmp(argv[1], "kernels")) return cmd_kernels(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "bench")) return cmd_bench(argc - 2, argv + 2);
@@ -639,6 +853,7 @@ int main(int argc, char **argv) {
                         "  plan <model.gguf> [--vram GiB]  GPU memory needed and how much context fits\n"
                         "  run <model.gguf> -p <prompt>    generate text\n"
                         "  chat <model.gguf>               interactive chat, one line per turn\n"
+                        "  serve <model.gguf>              Messages API server, for Claude Code and other clients of that API\n"
                         "  devices                         list Vulkan devices and the features this engine uses\n"
                         "  compare <model.gguf>            check the GPU engine against the CPU reference\n"
                         "  bench [model.gguf] [--wave 32|64]  memory roofline and kernel throughput; with a model, prompt and generation tok/s\n"

@@ -20,7 +20,11 @@ class Tokenizer {
 
     // parse_special: recognise control tokens such as <|im_start|> written out in the text.
     // add_special: prepend BOS when the model's metadata asks for it.
-    std::vector<int32_t> encode(std::string_view text, bool add_special, bool parse_special) const;
+    // literal: sorted, non-overlapping byte ranges [begin, end) of the text that are quoted
+    // material (a user's message, a file's contents): no control or other special token is
+    // recognised where it would overlap one, so quoted text can never act as markup.
+    using Ranges = std::vector<std::pair<size_t, size_t>>;
+    std::vector<int32_t> encode(std::string_view text, bool add_special, bool parse_special, const Ranges *literal = nullptr) const;
 
     // Raw bytes of one token (may be an incomplete UTF-8 sequence).
     std::string piece(int32_t token) const;

@@ -12,12 +12,16 @@ layout(binding = 0) readonly buffer BQ { float q[]; };
 layout(binding = 1) readonly buffer BKC { uint kc[]; };
 layout(binding = 2) readonly buffer BCTL { uint pos; } ctl;
 layout(binding = 3) writeonly buffer BSC { float sc[]; };   // [query head][n_ctx]
-layout(push_constant) uniform PC { uint hd; uint stride; uint n_ctx; float scale; uint nh; uint tq0; } pc;
+layout(binding = 4) readonly buffer BPT { uint pt[]; };     // page of the cache for each page of positions
+layout(push_constant) uniform PC { uint hd; uint stride; uint n_ctx; float scale; uint nh; uint tq0; uint page_shift; } pc;
 
 void main() {
     // Queries are scored in sub-batches: tq0 is the first query token of this one.
+    // t: position in the token stream; ct: where it is cached. A page is a whole number of
+    // workgroups, so the lanes still read adjacent words.
     uint t = gl_GlobalInvocationID.x, kvh = gl_WorkGroupID.y, lq = gl_WorkGroupID.z, tq = pc.tq0 + lq;
     if (t > ctl.pos + tq) return;
+    uint ct = (pt[t >> pc.page_shift] << pc.page_shift) | (t & ((1u << pc.page_shift) - 1u));
     float s[G];
     for (uint g = 0u; g < G; g++) s[g] = 0.0;
     uint qb = (tq * pc.nh + kvh * G) * pc.hd;
@@ -25,11 +29,11 @@ void main() {
     // planes per head: hd/4 words of four signed bytes, then hd/64 words of two half-precision scales
     uint base = kvh * (pc.hd / 4u + pc.hd / 64u);
     for (uint blk = 0u; blk < pc.hd / 32u; blk++) {
-        float bs = unpackHalf2x16(kc[(base + pc.hd / 4u + (blk >> 1)) * pc.stride + t])[blk & 1u];
+        float bs = unpackHalf2x16(kc[(base + pc.hd / 4u + (blk >> 1)) * pc.stride + ct])[blk & 1u];
         float a[G];
         for (uint g = 0u; g < G; g++) a[g] = 0.0;
         for (uint k = 0u; k < 8u; k++) {
-            int wv = int(kc[(base + blk * 8u + k) * pc.stride + t]);
+            int wv = int(kc[(base + blk * 8u + k) * pc.stride + ct]);
             uint d = blk * 32u + k * 4u;
             float b0 = float(bitfieldExtract(wv, 0, 8)), b1 = float(bitfieldExtract(wv, 8, 8)), b2 = float(bitfieldExtract(wv, 16, 8)), b3 = float(wv >> 24);
             for (uint g = 0u; g < G; g++) {
@@ -43,7 +47,7 @@ void main() {
     // planes per head: hd/2 words of two half-precision values
     uint base = kvh * (pc.hd / 2u);
     for (uint w = 0u; w < pc.hd / 2u; w++) {
-        vec2 kk = unpackHalf2x16(kc[(base + w) * pc.stride + t]);
+        vec2 kk = unpackHalf2x16(kc[(base + w) * pc.stride + ct]);
         for (uint g = 0u; g < G; g++) { uint o = qb + g * pc.hd + 2u * w; s[g] += kk.x * q[o] + kk.y * q[o + 1u]; }
     }
 #endif

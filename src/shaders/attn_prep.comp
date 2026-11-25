@@ -19,10 +19,13 @@ layout(binding = 6) writeonly buffer BGT { float gate[]; };
 // holding two half-precision scales, one scale per 32 values.
 layout(binding = 7) writeonly buffer BKC { uint kc[]; };
 layout(binding = 8) writeonly buffer BVC { uint vc[]; };
+// The caches are divided into pages of 2^page_shift positions; pt maps the pages of the token
+// stream being processed to pages of the cache.
+layout(binding = 9) readonly buffer BPT { uint pt[]; };
 #ifdef KV8
 shared int sq[gl_WorkGroupSize.x];
 #endif
-layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint qw; uint rope_dim; uint flags; float eps; uint stride; } pc;
+layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint qw; uint rope_dim; uint flags; float eps; uint stride; uint page_shift; } pc;
 // flags: 1 = normalise q and k, 2 = q carries a gate, 4 = rotation pairs are (i, i + rope_dim/2)
 shared float sv[gl_WorkGroupSize.x];
 shared float red[gl_WorkGroupSize.x];
@@ -69,7 +72,8 @@ uint packed4(uint d) { return uint(sq[d] & 255) | (uint(sq[d + 1u] & 255) << 8) 
 #endif
 
 void main() {
-    uint g = gl_WorkGroupID.x, d = gl_LocalInvocationID.x, tk = gl_WorkGroupID.y, pos = ctl.pos + tk;
+    uint g = gl_WorkGroupID.x, d = gl_LocalInvocationID.x, tk = gl_WorkGroupID.y, lpos = ctl.pos + tk;
+    uint pos = (pt[lpos >> pc.page_shift] << pc.page_shift) | (lpos & ((1u << pc.page_shift) - 1u));   // place in the cache
     uint qin = tk * pc.nh * pc.qw + g * pc.qw + d, qout = tk * pc.nh * pc.hd + g * pc.hd + d, kin = tk * pc.nkv * pc.hd + g * pc.hd + d;
     bool has_q = g < pc.nh, has_kv = g < pc.nkv;
     float qv = has_q ? qfull[qin] : 0.0;

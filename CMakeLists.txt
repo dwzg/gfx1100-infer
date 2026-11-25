@@ -17,6 +17,7 @@ find_package(Threads REQUIRED)
 add_library(gfxcore STATIC
   src/core/chat.cpp
   src/core/gguf.cpp
+  src/core/json.cpp
   src/core/model.cpp
   src/core/quant.cpp
   src/core/ref.cpp
@@ -57,11 +58,18 @@ gfx_shader(to_f16 to_f16.comp)
 gfx_shaders_finish()
 
 add_library(gfxgpu STATIC
-  src/engine/gpu_model.cpp
+  src/engine/gpu_model.cpp src/engine/context.cpp
   src/engine/pack.cpp
   src/vk/vk.cpp
   src/vk/shaders.cpp)
 target_link_libraries(gfxgpu PUBLIC gfxcore gfxshaders Vulkan::Vulkan)
 
+find_package(Threads REQUIRED)
+add_library(gfxserver STATIC
+  src/server/prompt.cpp
+  src/server/reply.cpp
+  src/server/server.cpp)
+target_link_libraries(gfxserver PUBLIC gfxgpu Threads::Threads)
+
 add_executable(gfxi src/tools/main.cpp)
-target_link_libraries(gfxi PRIVATE gfxgpu)
+target_link_libraries(gfxi PRIVATE gfxserver)

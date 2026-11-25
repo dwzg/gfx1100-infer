@@ -61,6 +61,8 @@ class Program {
     // Like dispatch, with the group counts (three uint32) read from `args` at submission time.
     void dispatch_indirect(const Pipeline *p, const std::vector<Binding> &bindings, const void *pc, size_t pc_bytes, const Buffer &args);
     void copy(const Buffer &src, const Buffer &dst);
+    // Several ranges in one command; each region is {offset in src, offset in dst, bytes}.
+    void copy_many(const Buffer &src, const Buffer &dst, const std::vector<VkBufferCopy> &regions);
     void finish();
     void run();              // submit and wait
     size_t n_dispatches() const { return n_dispatch_; }

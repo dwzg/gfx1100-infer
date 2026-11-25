@@ -29,17 +29,49 @@ class GpuModel {
     static uint64_t bytes_per_token(const ModelDesc &d, bool kv8);
     ~GpuModel();
 
-    void reset();
+    // ---- Token streams ----
+    // The attention caches are divided into pages that token streams ("sequences") take as they
+    // grow, so several conversations share the context memory, and one can branch off another
+    // without copying what they have in common. eval() and the calls below act on the selected
+    // sequence; sequence 0 exists from the start.
+    int seq_create();                        // a new, empty sequence
+    void seq_destroy(int id);                // give its pages back (not the selected one)
+    // A new sequence that starts as the first n positions of `src`, sharing their cache pages
+    // (a shared page is copied when one of the two writes to it).
+    int seq_fork(int src, int n);
+    // Select the sequence eval() continues. The linear-attention state on the GPU is not part
+    // of a sequence: the caller pairs sequences with state_save()/state_load().
+    void seq_select(int id);
+    int seq_selected() const { return active_; }
+    int seq_len(int id) const { return seqs_[id].len; }
+    void seq_truncate(int n);                // selected sequence: forget positions >= n
+    // Cache pages that extending sequence `id` to `upto` positions would take from the free ones.
+    int pages_needed(int id, int upto) const;
+    int pages_owned(int id) const;           // pages only sequence `id` uses (what destroying it would free)
+    int pages_free() const { return (int)free_pages_.size(); }
+    int pages_total() const { return (int)page_ref_.size(); }
+    int page_size() const { return (int)page_; }
+
+    // Everything outside the attention caches that depends on the tokens processed so far: the
+    // linear-attention state and the logits of the last token. Saved at position n of a sequence
+    // and loaded back later, it lets that sequence continue from n (models without
+    // linear-attention layers can continue from any position; for them this is just the logits).
+    bool has_recurrent_state() const { return recurrent_bytes_ > 0; }
+    size_t state_size() const { return recurrent_bytes_ + 4 * logits_.size(); }
+    void state_save(std::vector<uint8_t> &out);
+    void state_load(const std::vector<uint8_t> &in);
+    void state_clear();                      // the state before the first token
+
+    void reset();                            // selected sequence back to empty
     // Test aid: continue from position n as if n all-zero cache entries preceded it.
     void skip_to(int n);
-    int n_past() const { return n_past_; }
-    int n_ctx() const { return n_ctx_; }
+    int n_past() const { return seqs_[active_].len; }
+    int n_ctx() const { return n_ctx_; }     // longest sequence; also the positions all sequences share
     // Process tokens at the next positions. Returns the logits for the last one.
     const std::vector<float> &eval(const int32_t *tokens, int n);
 
-    // Save / restore everything that depends on the processed tokens (attention caches up to the
-    // current position, linear-attention state, last logits), so a long prompt is only paid for once.
-    // The file is tied to the model and cache type it was written with.
+    // Save / restore the selected sequence with its state in a file, so a long prompt is only
+    // paid for once. The file is tied to the model and cache type it was written with.
     void save_state(const std::string &path, const std::vector<int32_t> &tokens);
     std::vector<int32_t> load_state(const std::string &path);   // returns the tokens it was saved with
     const std::vector<float> &logits() const { return logits_; }
@@ -82,16 +114,34 @@ class GpuModel {
     void alloc_activations();
     Program &program(int n_tokens);
     void eval_batch(const int32_t *tokens, int n);
+    struct Seq { bool live = false; int len = 0; std::vector<uint32_t> pages; };
+    void take_pages(uint32_t pos0, uint32_t n);
+    void release_pages(Seq &s, size_t keep);
+    void copy_page(uint32_t from, uint32_t to);
+    void write_page_table();
+    using Regions = std::vector<std::pair<uint64_t, uint64_t>>;   // (offset, bytes) inside a buffer
+    void read_regions(const Buffer &b, const Regions &r, std::vector<uint8_t> &out);
+    void write_regions(const Buffer &b, const Regions &r, const uint8_t *data);
+    Regions key_regions(const Seq &s, int n) const;
+    Regions value_regions(const Seq &s, int n) const;
 
     Device &dev_;
     const GGUF &g_;
     ModelDesc d_;
-    int n_ctx_, n_past_ = 0;
+    int n_ctx_;
     bool force_fp16_ = false, kv8_ = false;
     std::vector<Layer> layers_;
     Buffer output_norm_;
     Matrix output_;
     Buffer ctl_, ind_, embd_, logits_host_, dummy_;
+    std::vector<Seq> seqs_;
+    int active_ = 0;
+    uint32_t page_ = 1024, page_shift_ = 10;       // cache positions per page
+    std::vector<uint32_t> page_ref_, free_pages_;  // sequences using each page; unused pages
+    Buffer pt_;                                    // page table of the selected sequence, read by the attention kernels
+    Buffer snap_, xfer_;                           // host copies: linear-attention state; transfers
+    std::unique_ptr<Program> snap_save_, snap_load_;
+    uint64_t recurrent_bytes_ = 0;
     std::vector<std::pair<uint32_t, Buffer>> tables_;   // codebooks, by tensor type
     uint32_t stride_ = 0, kv_words_ = 0;   // cache plane stride (positions, padded) and words per head per position
     std::vector<Buffer> zero_on_reset_;

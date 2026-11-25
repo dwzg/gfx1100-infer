@@ -1,6 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// Weighted sum of cached values, one segment of positions per workgroup.
+// Weighted sum of cached values, one segment (page) of positions per workgroup.
 // The value cache is row-major, [position][kv head][word]; one lane per word of a head's row, so a
 // wave reads a whole row with one coalesced load, and the weights (one per position and query
 // head) are the same for all lanes. Segments run in parallel; attn_combine adds them up.
@@ -11,6 +11,7 @@ layout(binding = 0) readonly buffer BVC { uint vc[]; };
 layout(binding = 1) readonly buffer BSC { float sc[]; };    // exp(score - max), [query head][n_ctx]
 layout(binding = 2) readonly buffer BCTL { uint pos; } ctl;
 layout(binding = 3) writeonly buffer BP { float part[]; };  // [segment][query head][hd]
+layout(binding = 4) readonly buffer BPT { uint pt[]; };     // page of the cache for each segment (a segment is one page)
 layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint n_ctx; uint seg; uint part_stride; uint tq0; } pc;
 #ifdef KV8
 #define VPW 4u       // values per word
@@ -21,12 +22,13 @@ layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint n_ctx; uint 
 void main() {
     uint sg = gl_WorkGroupID.x, kvh = gl_WorkGroupID.y, lq = gl_WorkGroupID.z, tq = pc.tq0 + lq, w = gl_LocalInvocationID.x;
     uint t0 = sg * pc.seg, t1 = min(ctl.pos + tq + 1u, t0 + pc.seg), sb = (lq * pc.nh + kvh * G) * pc.n_ctx;
+    uint c0 = pt[sg] * pc.seg - t0;   // cached row of position t is c0 + t (wraps, which is fine)
     float acc[G * VPW];
     for (uint i = 0u; i < G * VPW; i++) acc[i] = 0.0;
 #ifdef KV8
     uint pk = pc.hd / 4u + pc.hd / 64u, rv = pc.nkv * pk;
     for (uint t = t0; t < t1; t++) {
-        uint rb = t * rv + kvh * pk;
+        uint rb = (c0 + t) * rv + kvh * pk;
         int wv = int(vc[rb + w]);
         float bs = unpackHalf2x16(vc[rb + pc.hd / 4u + (w >> 4)])[(w >> 3) & 1u];
         vec4 v = vec4(float(bitfieldExtract(wv, 0, 8)), float(bitfieldExtract(wv, 8, 8)), float(bitfieldExtract(wv, 16, 8)), float(wv >> 24)) * bs;
@@ -38,7 +40,7 @@ void main() {
 #else
     uint pk = pc.hd / 2u, rv = pc.nkv * pk;
     for (uint t = t0; t < t1; t++) {
-        vec2 v = unpackHalf2x16(vc[t * rv + kvh * pk + w]);
+        vec2 v = unpackHalf2x16(vc[(c0 + t) * rv + kvh * pk + w]);
         for (uint g = 0u; g < G; g++) {
             float p = sc[sb + g * pc.n_ctx + t];
             acc[g * 2u] += p * v.x; acc[g * 2u + 1u] += p * v.y;

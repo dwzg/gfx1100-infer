@@ -35,5 +35,28 @@ done
 for g in "${ggufs[@]}"; do
   run "$GFXI" compare "$g" -n 3 --tol 0.01
 done
+
+# 5. Conversation cache (continuing, branching and returning to processed context) against plain processing.
+first_of() { for g in "${ggufs[@]}"; do case "$(basename "$g")" in $1) echo "$g"; return;; esac; done; }
+xml_model=$(first_of 'Qwen3.[5-9]*'); json_model=$(first_of 'Qwen3-*')
+for g in "$xml_model" "$json_model"; do [ -n "$g" ] && run "$GFXI" test-context "$g"; done
+[ -n "$xml_model" ] && run "$GFXI" test-context "$xml_model" --kv8
+
+# 6. Server: prompt formatting against the models' own chat templates (optional: needs `pip install jinja2`),
+#    and the reply parser.
+if "$PY" -c "import jinja2" 2>/dev/null; then
+  run "$PY" "$(dirname "$0")/test_chat.py" "$GFXI" "${ggufs[@]}"
+else echo "--- skipping chat-format test (python package jinja2 not installed)"; fi
+[ -n "$xml_model" ] && run "$PY" "$(dirname "$0")/test_reply.py" "$GFXI" "$xml_model" ${json_model:+"$json_model"}
+
+# 7. Server end to end through the Anthropic SDK (optional: needs `pip install anthropic`).
+if [ -n "$xml_model" ] && "$PY" -c "import anthropic" 2>/dev/null; then
+  port=${GFX_TEST_PORT:-18181}
+  "$GFXI" serve "$xml_model" --port "$port" --ctx 4096 --temp 0 2>/tmp/gfxi-serve.$$.log & server=$!
+  for i in $(seq 120); do curl -s --noproxy '*' -o /dev/null "http://127.0.0.1:$port/health" && break; sleep 1; done
+  NO_PROXY=127.0.0.1 no_proxy=127.0.0.1 run "$PY" "$(dirname "$0")/test_server.py" "http://127.0.0.1:$port"
+  kill $server 2>/dev/null; wait $server 2>/dev/null; rm -f /tmp/gfxi-serve.$$.log
+else echo "--- skipping server test (needs a Qwen 3.5+ test model and the python package anthropic)"; fi
+
 [ $fail -eq 0 ] && echo "ALL TESTS PASSED" || echo "SOME TESTS FAILED"
 exit $fail

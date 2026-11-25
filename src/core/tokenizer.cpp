@@ -159,17 +159,24 @@ void Tokenizer::encode_plain(std::string_view text, std::vector<int32_t> &out) c
     for (auto [b, e] : pieces) bpe_word(text.substr(off[b], off[e] - off[b]), out);
 }
 
-std::vector<int32_t> Tokenizer::encode(std::string_view text, bool add_special, bool parse_special) const {
+std::vector<int32_t> Tokenizer::encode(std::string_view text, bool add_special, bool parse_special, const Ranges *literal) const {
     std::vector<int32_t> out;
     if (add_special && add_bos_) out.push_back(bos_);
-    size_t start = 0;
+    size_t start = 0, li = 0;
     for (size_t i = 0; i < text.size();) {
         int32_t found = -1;
+        if (literal) {
+            // Inside quoted material nothing can match; skip to its end.
+            while (li < literal->size() && (*literal)[li].second <= i) li++;
+            if (li < literal->size() && (*literal)[li].first <= i) { i = (*literal)[li].second; continue; }
+        }
         for (int32_t id : special_by_first_[(uint8_t)text[i]]) {
             // User-defined tokens always match; control tokens only when asked to parse them.
             if (types_[id] == 3 && !parse_special) continue;
             const std::string &t = tokens_[id];
-            if (text.compare(i, t.size(), t) == 0) { found = id; break; }
+            if (text.compare(i, t.size(), t) != 0) continue;
+            if (literal && li < literal->size() && (*literal)[li].first < i + t.size()) continue;   // would run into quoted material
+            found = id; break;
         }
         if (found < 0) { i++; continue; }
         encode_plain(text.substr(start, i - start), out);

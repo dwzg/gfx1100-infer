@@ -437,6 +437,19 @@ void Program::copy(const Buffer &src, const Buffer &dst) {
     vkCmdCopyBuffer(cmd_, src.handle, dst.handle, 1, &region);
 }
 
+void Program::copy_many(const Buffer &src, const Buffer &dst, const std::vector<VkBufferCopy> &regions) {
+    if (regions.empty()) return;
+    if (!pending_reads_.empty() || !pending_writes_.empty()) barrier();
+    std::vector<VkBufferCopy> abs(regions);
+    for (VkBufferCopy &r : abs) {
+        if (r.srcOffset + r.size > src.size || r.dstOffset + r.size > dst.size) throw std::runtime_error("internal: copy region outside its buffer");
+        r.srcOffset += src.offset; r.dstOffset += dst.offset;
+    }
+    pending_reads_.push_back({src.handle, src.offset, src.offset + src.size});
+    pending_writes_.push_back({dst.handle, dst.offset, dst.offset + dst.size});
+    vkCmdCopyBuffer(cmd_, src.handle, dst.handle, (uint32_t)abs.size(), abs.data());
+}
+
 void Program::finish() {
     if (finished_) return;
     // Make results visible to the host and to later submissions.
