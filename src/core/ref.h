@@ -1,6 +1,7 @@
 // Reference implementation of the forward pass: plain scalar fp32 on the CPU, one token at a
 // time. It favours being obviously correct over speed; the GPU engine is validated against it.
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -21,6 +22,8 @@ class RefModel {
     void reset();
     int n_past() const { return n_past_; }
     int n_ctx() const { return n_ctx_; }
+    // Test aid: continue from position n as if n all-zero cache entries preceded it.
+    void skip_to(int n) { reset(); for (auto &c : k_cache_) std::fill(c.begin(), c.end(), 0.0f); for (auto &c : v_cache_) std::fill(c.begin(), c.end(), 0.0f); n_past_ = n; }
     // Process tokens at the next positions. Returns the logits for the last one.
     const std::vector<float> &eval(const int32_t *tokens, int n);
 

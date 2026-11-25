@@ -153,6 +153,8 @@ static int cmd_dequant_raw(int argc, char **argv) {
     return 0;
 }
 
+static double seconds_since(std::chrono::steady_clock::time_point t0) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+
 static std::string read_arg_text(const char *arg) {
     if (arg[0] != '@') return arg;
     FILE *f = fopen(arg + 1, "rb"); if (!f) throw std::runtime_error(std::string("cannot open ") + (arg + 1));
@@ -175,10 +177,11 @@ static int cmd_tokenize(int argc, char **argv) {
 static int cmd_run(int argc, char **argv) {
     if (argc < 1) {
         fprintf(stderr, "usage: gfxi run <model.gguf> -p <prompt | @file> [-n tokens] [--chat] [--temp T] [--top-k K] [--top-p P]\n"
-                        "                [--seed S] [--ctx N|max] [--reserve GiB] [--threads N] [--device gpu|cpu|<name>] [--kv8] [--logits out.f32]\n");
+                        "                [--seed S] [--ctx N|max] [--reserve GiB] [--threads N] [--device gpu|cpu|<name>] [--kv8] [--logits out.f32]\n"
+                        "                [--save-state file] [--load-state file]   keep / reuse a processed prompt\n");
         return 2;
     }
-    std::string prompt, logits_path, device = "gpu"; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false, kv8 = false, ctx_max = false; double reserve_gib = 0.25;
+    std::string prompt, logits_path, save_path, load_path, device = "gpu"; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false, kv8 = false, ctx_max = false; double reserve_gib = 0.25;
     SamplerParams sp; sp.temperature = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -196,14 +199,19 @@ static int cmd_run(int argc, char **argv) {
         else if (a == "--logits") logits_path = next();
         else if (a == "--device") device = next();
         else if (a == "--kv8") kv8 = true;
+        else if (a == "--save-state") save_path = next();
+        else if (a == "--load-state") load_path = next();
         else throw std::runtime_error("unknown option " + a);
     }
+    if ((!save_path.empty() || !load_path.empty()) && device == "cpu") throw std::runtime_error("saved contexts need the GPU path");
     GGUF g; g.open(argv[0]);
     ModelDesc desc = describe_model(g);
     Tokenizer tok(g);
     if (chat) prompt = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
-    std::vector<int32_t> ids = tok.encode(prompt, true, true);
-    if (ids.empty()) throw std::runtime_error("the prompt is empty");
+    // When continuing a saved context the prompt is appended to it, so no start-of-text token.
+    std::vector<int32_t> ids = tok.encode(prompt, load_path.empty(), true);
+    if (ids.empty() && load_path.empty()) throw std::runtime_error("the prompt is empty");
+    if (n_ctx <= 0 && !load_path.empty()) ctx_max = true;
     if (n_ctx <= 0) n_ctx = (int)ids.size() + n_predict + 1;
     std::unique_ptr<RefModel> ref; std::unique_ptr<Device> dev; std::unique_ptr<GpuModel> gpu;
     std::function<const std::vector<float> &(const int32_t *, int)> eval;
@@ -221,9 +229,21 @@ static int cmd_run(int argc, char **argv) {
         eval = [&](const int32_t *t, int n) -> const std::vector<float> & { return gpu->eval(t, n); };
     }
     Sampler sampler(sp);
+    std::vector<int32_t> history;
+    if (!load_path.empty()) {
+        auto tl = std::chrono::steady_clock::now();
+        history = gpu->load_state(load_path);
+        fprintf(stderr, "[restored %d tokens of context from %s in %.1f s]\n", gpu->n_past(), load_path.c_str(), seconds_since(tl));
+        if (gpu->n_past() + (int)ids.size() >= gpu->n_ctx()) throw std::runtime_error("the saved context plus the prompt does not fit the context");
+    }
     auto t0 = std::chrono::steady_clock::now();
-    const std::vector<float> *logits = &eval(ids.data(), (int)ids.size());
+    const std::vector<float> *logits = ids.empty() ? &gpu->logits() : &eval(ids.data(), (int)ids.size());
     auto t1 = std::chrono::steady_clock::now();
+    if (!save_path.empty()) {
+        history.insert(history.end(), ids.begin(), ids.end());
+        gpu->save_state(save_path, history);
+        fprintf(stderr, "[saved %d tokens of context to %s]\n", gpu->n_past(), save_path.c_str());
+    }
     if (!logits_path.empty()) {
         FILE *f = fopen(logits_path.c_str(), "wb");
         if (!f || fwrite(logits->data(), 4, logits->size(), f) != logits->size()) throw std::runtime_error("cannot write " + logits_path);
@@ -247,8 +267,8 @@ static int cmd_run(int argc, char **argv) {
 
 // Run the GPU engine and the CPU reference on the same tokens and report how closely they agree.
 static int cmd_compare(int argc, char **argv) {
-    if (argc < 1) { fprintf(stderr, "usage: gfxi compare <model.gguf> [-p prompt] [-n extra tokens] [--device name] [--tol T]\n"); return 2; }
-    std::string prompt = "The quick brown fox jumps over the lazy dog. In 1969, humans first", device; int n_extra = 8; double tol = 0.05; bool fp16 = false, kv8 = false;
+    if (argc < 1) { fprintf(stderr, "usage: gfxi compare <model.gguf> [-p prompt] [-n extra tokens] [--device name] [--tol T] [--kv8] [--skip N]\n"); return 2; }
+    std::string prompt = "The quick brown fox jumps over the lazy dog. In 1969, humans first", device; int n_extra = 8; double tol = 0.05; bool fp16 = false, kv8 = false; int skip = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
@@ -258,18 +278,20 @@ static int cmd_compare(int argc, char **argv) {
         else if (a == "--tol") tol = atof(next());
         else if (a == "--fp16") fp16 = true;
         else if (a == "--kv8") kv8 = true;
+        else if (a == "--skip") skip = atoi(next());   // start at this position, over an all-zero cache
         else throw std::runtime_error("unknown option " + a);
     }
     GGUF g; g.open(argv[0]);
     ModelDesc desc = describe_model(g);
     Tokenizer tok(g);
     std::vector<int32_t> ids = tok.encode(prompt, true, true);
-    int n_ctx = (int)ids.size() + n_extra + 1;
+    int n_ctx = skip + (int)ids.size() + n_extra + 1;
     Device dev(device);
     GpuModel gpu(dev, g, desc, n_ctx, fp16, kv8);
     printf("weights on device: %.3f GiB\n", gpu.weight_bytes() / 1073741824.0);
     RefModel ref(g, desc, n_ctx, (int)std::thread::hardware_concurrency());
-    printf("device %s, model %s, %zu prompt tokens + %d generated\n", dev.caps().name.c_str(), desc.name.c_str(), ids.size(), n_extra);
+    if (skip > 0) { gpu.skip_to(skip); ref.skip_to(skip); }
+    printf("device %s, model %s, %zu prompt tokens + %d generated, starting at position %d\n", dev.caps().name.c_str(), desc.name.c_str(), ids.size(), n_extra, skip);
     double worst = 0; int mismatches = 0, steps = 0;
     auto step = [&](const int32_t *t, int n) -> int32_t {
         const std::vector<float> &lr = ref.eval(t, n), &lg = gpu.eval(t, n);
@@ -302,8 +324,6 @@ static int cmd_devices() {
     printf("  largest buffer bind   %.2f GiB\n", c.max_storage_range / 1073741824.0);
     return 0;
 }
-
-static double seconds_since(std::chrono::steady_clock::time_point t0) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
 
 // Device benchmark: achievable memory bandwidth, the throughput of each quantised matvec kernel
 // relative to it, and the fixed cost of a dispatch. With a model: tokens per second.

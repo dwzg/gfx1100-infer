@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
@@ -99,6 +100,12 @@ GpuModel::~GpuModel() = default;
 void GpuModel::reset() {
     n_past_ = 0;
     for (const Buffer &b : zero_on_reset_) dev_.fill_zero(b);
+}
+
+void GpuModel::skip_to(int n) {
+    reset();
+    for (Layer &l : layers_) if (!l.recurrent) { dev_.fill_zero(l.kc); dev_.fill_zero(l.vc); }
+    n_past_ = n;
 }
 
 Buffer GpuModel::load_vector(const TensorInfo *t) {
@@ -294,6 +301,73 @@ const std::vector<float> &GpuModel::eval(const int32_t *tokens, int n) {
     for (int i = 0; i < n; i++) eval_one(tokens[i]);
     memcpy(logits_.data(), logits_host_.mapped, logits_.size() * 4);
     return logits_;
+}
+
+}  // namespace gfx
+
+namespace gfx {
+
+namespace {
+struct StateHeader {
+    char magic[8];
+    uint32_t version, kv8, n_layer, n_attn, head_dim, n_head_kv, kv_words, n_embd, n_vocab, n_past, n_tokens, pad;
+    uint64_t model_bytes;
+};
+const char k_state_magic[8] = {'G', 'F', 'X', 'C', 'T', 'X', '1', 0};
+
+struct File {
+    FILE *f; std::string path;
+    File(const std::string &p, const char *mode) : f(fopen(p.c_str(), mode)), path(p) { if (!f) throw std::runtime_error("cannot open " + p); }
+    ~File() { if (f) fclose(f); }
+    void write(const void *d, size_t n) { if (n && fwrite(d, 1, n, f) != n) throw std::runtime_error("write failed: " + path); }
+    void read(void *d, size_t n) { if (n && fread(d, 1, n, f) != n) throw std::runtime_error("state file is truncated: " + path); }
+};
+}  // namespace
+
+void GpuModel::save_state(const std::string &path, const std::vector<int32_t> &tokens) {
+    File f(path, "wb");
+    StateHeader h{};
+    memcpy(h.magic, k_state_magic, 8);
+    h.version = 1; h.kv8 = kv8_; h.n_layer = d_.n_layer; h.n_attn = d_.n_attn_layers(); h.head_dim = d_.head_dim; h.n_head_kv = d_.n_head_kv;
+    h.kv_words = kv_words_; h.n_embd = d_.n_embd; h.n_vocab = d_.n_vocab; h.n_past = n_past_; h.n_tokens = (uint32_t)tokens.size(); h.model_bytes = g_.file_size;
+    f.write(&h, sizeof h);
+    f.write(tokens.data(), tokens.size() * 4);
+    f.write(logits_.data(), logits_.size() * 4);
+    std::vector<uint8_t> buf;
+    auto dump = [&](const Buffer &b, uint64_t off, uint64_t bytes) { buf.resize(bytes); dev_.download(b.sub(off, bytes), buf.data(), bytes); f.write(buf.data(), bytes); };
+    const uint64_t used = 4ull * n_past_, planes = (uint64_t)d_.n_head_kv * kv_words_;
+    for (const Layer &l : layers_) {
+        if (l.recurrent) { dump(l.state, 0, l.state.size); dump(l.hist, 0, l.hist.size); continue; }
+        if (n_past_ == 0) continue;
+        for (uint64_t pl = 0; pl < planes; pl++) dump(l.kc, pl * stride_ * 4, used);   // each key plane: the filled positions only
+        dump(l.vc, 0, used * planes);
+    }
+}
+
+std::vector<int32_t> GpuModel::load_state(const std::string &path) {
+    File f(path, "rb");
+    StateHeader h;
+    f.read(&h, sizeof h);
+    if (memcmp(h.magic, k_state_magic, 8) || h.version != 1) throw std::runtime_error(path + " is not a saved context");
+    if (h.model_bytes != g_.file_size || h.n_layer != (uint32_t)d_.n_layer || h.head_dim != (uint32_t)d_.head_dim || h.n_head_kv != (uint32_t)d_.n_head_kv ||
+        h.n_embd != (uint32_t)d_.n_embd || h.n_vocab != (uint32_t)d_.n_vocab)
+        throw std::runtime_error("the saved context was made with a different model");
+    if (h.kv8 != (uint32_t)kv8_ || h.kv_words != kv_words_) throw std::runtime_error(std::string("the saved context uses the ") + (h.kv8 ? "8-bit" : "half-precision") + " cache; run with the same cache type");
+    if ((int)h.n_past >= n_ctx_) throw std::runtime_error("the saved context (" + std::to_string(h.n_past) + " tokens) does not fit the current context size");
+    std::vector<int32_t> tokens(h.n_tokens);
+    f.read(tokens.data(), tokens.size() * 4);
+    f.read(logits_.data(), logits_.size() * 4);
+    std::vector<uint8_t> buf;
+    auto restore = [&](const Buffer &b, uint64_t off, uint64_t bytes) { buf.resize(bytes); f.read(buf.data(), bytes); dev_.upload(b.sub(off, bytes), buf.data(), bytes); };
+    const uint64_t used = 4ull * h.n_past, planes = (uint64_t)d_.n_head_kv * kv_words_;
+    for (const Layer &l : layers_) {
+        if (l.recurrent) { restore(l.state, 0, l.state.size); restore(l.hist, 0, l.hist.size); continue; }
+        if (h.n_past == 0) continue;
+        for (uint64_t pl = 0; pl < planes; pl++) restore(l.kc, pl * stride_ * 4, used);
+        restore(l.vc, 0, used * planes);
+    }
+    n_past_ = (int)h.n_past;
+    return tokens;
 }
 
 }  // namespace gfx

@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "core/model.h"
@@ -23,10 +24,19 @@ class GpuModel {
     ~GpuModel();
 
     void reset();
+    // Test aid: continue from position n as if n all-zero cache entries preceded it.
+    void skip_to(int n);
     int n_past() const { return n_past_; }
     int n_ctx() const { return n_ctx_; }
     // Process tokens at the next positions. Returns the logits for the last one.
     const std::vector<float> &eval(const int32_t *tokens, int n);
+
+    // Save / restore everything that depends on the processed tokens (attention caches up to the
+    // current position, linear-attention state, last logits), so a long prompt is only paid for once.
+    // The file is tied to the model and cache type it was written with.
+    void save_state(const std::string &path, const std::vector<int32_t> &tokens);
+    std::vector<int32_t> load_state(const std::string &path);   // returns the tokens it was saved with
+    const std::vector<float> &logits() const { return logits_; }
 
     uint64_t weight_bytes() const { return weight_bytes_; }
     uint64_t state_bytes() const { return state_bytes_; }
