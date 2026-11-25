@@ -11,7 +11,10 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 add_library(gfxcore STATIC
   src/core/gguf.cpp
-  src/core/quant.cpp)
+  src/core/quant.cpp
+  src/core/regex.cpp
+  src/core/tokenizer.cpp
+  src/core/unicode.cpp)
 target_include_directories(gfxcore PUBLIC src)
 
 add_executable(gfxi src/tools/main.cpp)

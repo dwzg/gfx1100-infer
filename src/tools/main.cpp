@@ -10,6 +10,7 @@
 
 #include "core/gguf.h"
 #include "core/quant.h"
+#include "core/tokenizer.h"
 
 using namespace gfx;
 
@@ -83,12 +84,33 @@ static int cmd_dequant_raw(int argc, char **argv) {
     return 0;
 }
 
+static std::string read_arg_text(const char *arg) {
+    if (arg[0] != '@') return arg;
+    FILE *f = fopen(arg + 1, "rb"); if (!f) throw std::runtime_error(std::string("cannot open ") + (arg + 1));
+    std::string s; char buf[65536]; size_t r;
+    while ((r = fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, r);
+    fclose(f); return s;
+}
+
+static int cmd_tokenize(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: gfxi tokenize <model.gguf> <text | @file> [--no-special]\n"); return 2; }
+    GGUF g; g.open(argv[0]);
+    Tokenizer tok(g);
+    bool special = !(argc > 2 && !strcmp(argv[2], "--no-special"));
+    std::vector<int32_t> ids = tok.encode(read_arg_text(argv[1]), false, special);
+    for (size_t i = 0; i < ids.size(); i++) printf("%s%d", i ? " " : "", ids[i]);
+    printf("\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     try {
         if (argc >= 2 && !strcmp(argv[1], "info")) return cmd_info(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "dequant")) return cmd_dequant(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "tokenize")) return cmd_tokenize(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "dequant-raw")) return cmd_dequant_raw(argc - 2, argv + 2);
-        fprintf(stderr, "usage: gfxi <command> ...\n  info <model.gguf> [--tensors]   show model metadata and weight encodings\n");
+        fprintf(stderr, "usage: gfxi <command> ...\n  info <model.gguf> [--tensors]   show model metadata and weight encodings\n"
+                        "  tokenize <model.gguf> <text|@file>  print token ids\n");
         return 2;
     } catch (const std::exception &e) {
         fprintf(stderr, "error: %s\n", e.what());
