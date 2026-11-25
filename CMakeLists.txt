@@ -15,6 +15,7 @@ endif()
 find_package(Threads REQUIRED)
 
 add_library(gfxcore STATIC
+  src/core/chat.cpp
   src/core/gguf.cpp
   src/core/model.cpp
   src/core/quant.cpp

@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "core/chat.h"
 #include "core/gguf.h"
 #include "core/model.h"
 #include "core/quant.h"
@@ -177,12 +178,12 @@ static int cmd_tokenize(int argc, char **argv) {
 
 static int cmd_run(int argc, char **argv) {
     if (argc < 1) {
-        fprintf(stderr, "usage: gfxi run <model.gguf> -p <prompt | @file> [-n tokens] [--chat] [--temp T] [--top-k K] [--top-p P]\n"
+        fprintf(stderr, "usage: gfxi run <model.gguf> -p <prompt | @file> [-n tokens] [--chat [--system S] [--no-think]] [--temp T] [--top-k K] [--top-p P]\n"
                         "                [--seed S] [--ctx N|max] [--reserve GiB] [--threads N] [--device gpu|cpu|<name>] [--kv8] [--batch N] [--logits out.f32]\n"
                         "                [--save-state file] [--load-state file]   keep / reuse a processed prompt\n");
         return 2;
     }
-    std::string prompt, logits_path, save_path, load_path, device = "gpu"; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false, kv8 = false, ctx_max = false; double reserve_gib = 0.25; int batch = 32;
+    std::string prompt, logits_path, save_path, load_path, system_prompt, device = "gpu"; bool think = true; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false, kv8 = false, ctx_max = false; double reserve_gib = 0.25; int batch = 32;
     SamplerParams sp; sp.temperature = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -190,6 +191,8 @@ static int cmd_run(int argc, char **argv) {
         if (a == "-p") prompt = read_arg_text(next());
         else if (a == "-n") n_predict = atoi(next());
         else if (a == "--chat") chat = true;
+        else if (a == "--system") system_prompt = read_arg_text(next());
+        else if (a == "--no-think") think = false;
         else if (a == "--temp") sp.temperature = (float)atof(next());
         else if (a == "--top-k") sp.top_k = atoi(next());
         else if (a == "--top-p") sp.top_p = (float)atof(next());
@@ -209,7 +212,11 @@ static int cmd_run(int argc, char **argv) {
     GGUF g; g.open(argv[0]);
     ModelDesc desc = describe_model(g);
     Tokenizer tok(g);
-    if (chat) prompt = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    if (chat) {
+        ChatFormat cf = detect_chat_format(g);
+        if (!cf.supported) throw std::runtime_error("this model's chat template (" + cf.name + ") is not supported; pass the full prompt with -p instead");
+        prompt = (system_prompt.empty() ? "" : cf.message("system", system_prompt)) + cf.message("user", prompt) + cf.reply_start(think);
+    }
     // When continuing a saved context the prompt is appended to it, so no start-of-text token.
     std::vector<int32_t> ids = tok.encode(prompt, load_path.empty(), true);
     if (ids.empty() && load_path.empty()) throw std::runtime_error("the prompt is empty");
@@ -264,6 +271,84 @@ static int cmd_run(int argc, char **argv) {
     auto t2 = std::chrono::steady_clock::now();
     double pre = std::chrono::duration<double>(t1 - t0).count(), gen = std::chrono::duration<double>(t2 - t1).count();
     fprintf(stderr, "[prompt %d tokens in %.2f s, generated %d tokens in %.2f s (%.2f tok/s)]\n", (int)ids.size(), pre, n_gen, gen, n_gen > 1 ? (n_gen - 1) / gen : 0.0);
+    return 0;
+}
+
+// Interactive chat: one line of input per turn, the context is kept between turns.
+static int cmd_chat(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "usage: gfxi chat <model.gguf> [--system S] [--no-think] [-n max reply tokens] [--ctx N|max] [--reserve GiB] [--kv8]\n"
+                        "                 [--temp T] [--top-k K] [--top-p P] [--seed S] [--batch N] [--device name]\n"
+                        "                 [--load-state file]   start from a saved context (for example a long document)\n");
+        return 2;
+    }
+    GGUF g; g.open(argv[0]);
+    ModelDesc desc = describe_model(g);
+    Tokenizer tok(g);
+    ChatFormat cf = detect_chat_format(g);
+    if (!cf.supported) throw std::runtime_error("this model's chat template (" + cf.name + ") is not supported");
+    std::string system_prompt, device, load_path; bool think = true, kv8 = false, ctx_max = false; int n_reply = 2048, n_ctx = 8192, batch = 32; double reserve_gib = 0.25;
+    // Sampling defaults: what the model file recommends, if it says.
+    SamplerParams sp;
+    sp.temperature = (float)g.get_float("general.sampling.temp", 0.7); sp.top_k = (int)g.get_int("general.sampling.top_k", 20); sp.top_p = (float)g.get_float("general.sampling.top_p", 0.8);
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
+        if (a == "--system") system_prompt = read_arg_text(next());
+        else if (a == "--no-think") think = false;
+        else if (a == "-n") n_reply = atoi(next());
+        else if (a == "--ctx") { std::string v = next(); if (v == "max") ctx_max = true; else n_ctx = atoi(v.c_str()); }
+        else if (a == "--reserve") reserve_gib = atof(next());
+        else if (a == "--kv8") kv8 = true;
+        else if (a == "--temp") sp.temperature = (float)atof(next());
+        else if (a == "--top-k") sp.top_k = atoi(next());
+        else if (a == "--top-p") sp.top_p = (float)atof(next());
+        else if (a == "--seed") sp.seed = strtoull(next(), nullptr, 10);
+        else if (a == "--batch") batch = atoi(next());
+        else if (a == "--device") device = next();
+        else if (a == "--load-state") { load_path = next(); ctx_max = true; }
+        else throw std::runtime_error("unknown option " + a);
+    }
+    Device dev(device);
+    fprintf(stderr, "[%s] loading %s ...\n", dev.caps().name.c_str(), desc.name.c_str());
+    GpuModel gpu(dev, g, desc, ctx_max ? 0 : n_ctx, false, kv8, (uint64_t)(reserve_gib * 1073741824.0), batch);
+    Sampler sampler(sp);
+    bool first = true;
+    if (!load_path.empty()) { gpu.load_state(load_path); first = false; fprintf(stderr, "[restored %d tokens of context]\n", gpu.n_past()); }
+    fprintf(stderr, "[context %d tokens, %s cache; temperature %.2f, top-k %d, top-p %.2f; end input (Ctrl-D) to quit]\n", gpu.n_ctx(), kv8 ? "8-bit" : "half-precision",
+            sp.temperature, sp.top_k, sp.top_p);
+    bool reply_open = false;   // the previous reply still needs its closing marker
+    std::string line;
+    for (;;) {
+        fprintf(stderr, "\n> "); fflush(stderr);
+        line.clear();
+        int ch; while ((ch = getchar()) != EOF && ch != '\n') line += (char)ch;
+        if (ch == EOF && line.empty()) break;
+        if (line.empty()) continue;
+        std::string text = reply_open ? cf.reply_end() : "";
+        if (first && !system_prompt.empty()) text += cf.message("system", system_prompt);
+        text += cf.message("user", line) + cf.reply_start(think);
+        std::vector<int32_t> ids = tok.encode(text, first, true);
+        first = false;
+        if (gpu.n_past() + (int)ids.size() + 1 >= gpu.n_ctx()) { fprintf(stderr, "[the context is full: %d of %d tokens used]\n", gpu.n_past(), gpu.n_ctx()); break; }
+        auto t0 = std::chrono::steady_clock::now();
+        const std::vector<float> *logits = &gpu.eval(ids.data(), (int)ids.size());
+        double t_prompt = seconds_since(t0);
+        std::string pending; int n_gen = 0;
+        auto t1 = std::chrono::steady_clock::now();
+        while (n_gen < n_reply && gpu.n_past() + 1 < gpu.n_ctx()) {
+            int32_t t = sampler.sample(logits->data(), (int)logits->size());
+            if (tok.is_eog(t)) break;
+            pending += tok.piece(t);
+            size_t ok = utf8_complete_prefix(pending);
+            fwrite(pending.data(), 1, ok, stdout); fflush(stdout); pending.erase(0, ok);
+            logits = &gpu.eval(&t, 1); n_gen++;
+        }
+        fwrite(pending.data(), 1, pending.size(), stdout); printf("\n"); fflush(stdout);
+        reply_open = true;
+        fprintf(stderr, "[%d prompt tokens in %.2f s, %d reply tokens at %.1f tok/s, context %d / %d]\n", (int)ids.size(), t_prompt, n_gen,
+                n_gen ? n_gen / seconds_since(t1) : 0.0, gpu.n_past(), gpu.n_ctx());
+    }
     return 0;
 }
 
@@ -495,6 +580,7 @@ int main(int argc, char **argv) {
         if (argc >= 2 && !strcmp(argv[1], "plan")) return cmd_plan(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "dequant")) return cmd_dequant(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "run")) return cmd_run(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "chat")) return cmd_chat(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "compare")) return cmd_compare(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "devices")) return cmd_devices();
         if (argc >= 2 && !strcmp(argv[1], "kernels")) return cmd_kernels(argc - 2, argv + 2);
@@ -505,6 +591,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: gfxi <command> ...\n  info <model.gguf> [--tensors]   show model metadata and weight encodings\n"
                         "  plan <model.gguf> [--vram GiB]  GPU memory needed and how much context fits\n"
                         "  run <model.gguf> -p <prompt>    generate text\n"
+                        "  chat <model.gguf>               interactive chat, one line per turn\n"
                         "  devices                         list Vulkan devices and the features this engine uses\n"
                         "  compare <model.gguf>            check the GPU engine against the CPU reference\n"
                         "  bench [model.gguf] [--wave 32|64]  memory roofline and kernel throughput; with a model, tokens per second\n"
