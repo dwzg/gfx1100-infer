@@ -258,7 +258,7 @@ class Service {
 
     // Token ids of a piece of prompt text. The same messages come back with every request of a
     // conversation, so results are remembered.
-    const std::vector<int32_t> &encode(const MarkedText &t) {
+    std::vector<int32_t> encode(const MarkedText &t) {
         std::string key = t.s;
         key += '\x01';
         for (auto [b, e] : t.literal) { key += std::to_string(b); key += '-'; key += std::to_string(e); key += ','; }
@@ -288,7 +288,7 @@ class Service {
                 auto it = generated_.find(piece.text.s);
                 if (it != generated_.end()) { b.ids.insert(b.ids.end(), it->second.begin(), it->second.end()); continue; }
             }
-            const std::vector<int32_t> &ids = encode(piece.text);
+            const std::vector<int32_t> ids = encode(piece.text);
             if (i == 0 && b.prompt.has_system) {
                 // Worth a checkpoint each: the end of the tool list (shared by conversations whose
                 // instructions differ) and the end of the system message.
@@ -296,7 +296,7 @@ class Service {
                     MarkedText head;
                     head.s = piece.text.s.substr(0, b.prompt.tools_bytes);
                     for (auto [lb, le] : piece.text.literal) if (lb < head.s.size()) head.literal.emplace_back(lb, std::min(le, head.s.size()));
-                    size_t same = common_prefix(tok_.encode(head.s, false, true, &head.literal), ids);
+                    size_t same = common_prefix(encode(head), ids);
                     if (same > 64) b.marks.push_back((int)same - 2);   // the last tokens may spell differently when other text follows
                 }
                 b.marks.push_back((int)ids.size());
