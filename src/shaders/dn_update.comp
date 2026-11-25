@@ -13,10 +13,11 @@ layout(binding = 3) readonly buffer BDT { float dt[]; };
 layout(binding = 4) readonly buffer BA { float a[]; };
 layout(binding = 5) buffer BS { float st[]; };
 layout(binding = 6) writeonly buffer BO { float o[]; };
-layout(push_constant) uniform PC { uint hk; } pc;
+layout(push_constant) uniform PC { uint hk; uint s; } pc;   // s = head_dim again, as a run-time value so the
+                                                            // driver keeps the loops below as loops
 
 void main() {
-    uint hv = gl_WorkGroupID.x, j = gl_LocalInvocationID.x, S = gl_WorkGroupSize.x;
+    uint hv = gl_WorkGroupID.x, j = gl_LocalInvocationID.x, S = pc.s;
     uint kh = hv % pc.hk, qb = kh * S, kb = pc.hk * S + kh * S, vb = 2u * pc.hk * S + hv * S, sb = hv * S * S;
     float decay = exp(softplus(alpha[hv] + dt[hv]) * a[hv]);
     float b = sigmoid(beta[hv]);

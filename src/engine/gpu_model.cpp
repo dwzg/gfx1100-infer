@@ -184,8 +184,8 @@ void GpuModel::build_program() {
             matvec(p, l.wqkv, h, mixed); matvec(p, l.wz, h, z); matvec(p, l.wbeta, h, beta); matvec(p, l.walpha, h, alpha);
             PcDnPrep pp{(uint32_t)(2 * HK), (uint32_t)d_.dn_conv, d_.norm_eps};
             p.dispatch(p_dn_prep, {R(mixed), W(l.hist), R(l.conv_w), W(qkv)}, &pp, sizeof pp, C / S);
-            uint32_t hk = HK;
-            p.dispatch(p_dn_update, {R(qkv), R(alpha), R(beta), R(l.dt), R(l.a), W(l.state), W(dn_o)}, &hk, sizeof hk, HV);
+            uint32_t pu[2] = {(uint32_t)HK, (uint32_t)S};
+            p.dispatch(p_dn_update, {R(qkv), R(alpha), R(beta), R(l.dt), R(l.a), W(l.state), W(dn_o)}, pu, sizeof pu, HV);
             norm(dn_o, Buffer{}, l.ssm_norm, z, dn_on.v, S, HV); blocksum(p, dn_on);
             matvec(p, l.ssm_out, dn_on, a);
         } else {

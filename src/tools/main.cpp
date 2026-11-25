@@ -21,6 +21,7 @@
 #include "core/sampler.h"
 #include "core/unicode.h"
 #include "engine/gpu_model.h"
+#include "engine/pack.h"
 #include "vk/vk.h"
 #include "core/tokenizer.h"
 
@@ -242,6 +243,49 @@ static int cmd_devices() {
     return 0;
 }
 
+// Check one quantised matvec kernel against the scalar decoder, on raw block data of the given
+// type laid out as a matrix with n_in columns and a random input vector.
+static int cmd_test_matvec(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: gfxi test-matvec <type-id> <blocks.bin> <n_in> [--device name]\n"); return 2; }
+    uint32_t type = (uint32_t)atoi(argv[0]), n_in = (uint32_t)atoi(argv[2]);
+    std::string device = argc > 4 && !strcmp(argv[3], "--device") ? argv[4] : "";
+    const TypeInfo *ti = type_info(type); const PackFormat *pf = pack_format(type);
+    if (!ti || !pf) { fprintf(stderr, "type has no native GPU layout\n"); return 1; }
+    if (n_in % pf->sb_cols) { fprintf(stderr, "n_in must be a multiple of %u\n", pf->sb_cols); return 1; }
+    FILE *f = fopen(argv[1], "rb"); if (!f) { perror(argv[1]); return 1; }
+    std::vector<uint8_t> in; uint8_t buf[65536]; size_t r;
+    while ((r = fread(buf, 1, sizeof buf, f)) > 0) in.insert(in.end(), buf, buf + r);
+    fclose(f);
+    uint64_t row_bytes = (uint64_t)n_in / ti->block_elems * ti->block_bytes;
+    uint32_t rows = (uint32_t)(in.size() / row_bytes), stride = (rows + 63) / 64 * 64;
+    if (rows == 0) { fprintf(stderr, "not enough data for one row\n"); return 1; }
+    std::vector<float> x(n_in), xs(n_in / 16), want(rows), wrow(n_in), got(rows);
+    uint32_t seed = 12345;
+    for (auto &v : x) { seed = seed * 1664525u + 1013904223u; v = ((seed >> 8) & 0xFFFF) / 32768.0f - 1.0f; }
+    for (uint32_t b = 0; b < n_in / 16; b++) { float t = 0; for (int i = 0; i < 16; i++) t += x[16 * b + i]; xs[b] = t; }
+    double ref_norm = 0;
+    for (uint32_t row = 0; row < rows; row++) {
+        dequantize(type, in.data() + row * row_bytes, wrow.data(), n_in);
+        double t = 0; for (uint32_t i = 0; i < n_in; i++) t += (double)wrow[i] * x[i];
+        want[row] = (float)t; ref_norm += t * t;
+    }
+    Device dev(device);
+    uint64_t words = (uint64_t)(n_in / pf->sb_cols) * pf->sb_words * stride;
+    std::vector<uint32_t> packed(words);
+    pack_rows(*pf, in.data(), n_in, 0, rows, stride, packed.data());
+    Buffer bw = dev.alloc(words * 4), bx = dev.alloc(n_in * 4ull), bxs = dev.alloc(xs.size() * 4), by = dev.alloc(stride * 4ull), dummy = dev.alloc(256);
+    dev.upload(bw, packed.data(), words * 4); dev.upload(bx, x.data(), n_in * 4ull); dev.upload(bxs, xs.data(), xs.size() * 4); dev.fill_zero(dummy);
+    struct { uint32_t n_sb, stride, n_rows, row0, flags; } pc{n_in / pf->sb_cols, stride, rows, 0, 0};
+    Program p(dev);
+    p.dispatch(dev.pipeline(pf->kernel), {R(bw), R(bx), R(bxs), W(by), R(dummy)}, &pc, sizeof pc, stride / 64);
+    p.finish(); p.run();
+    dev.download(by, got.data(), rows * 4ull);
+    double err = 0; for (uint32_t i = 0; i < rows; i++) { double d = (double)got[i] - want[i]; err += d * d; }
+    double rel = std::sqrt(err / std::max(ref_norm, 1e-30));
+    printf("%s %s: %u rows x %u columns, relative error %.2e\n", rel < 1e-4 ? "ok  " : "FAIL", ti->name, rows, n_in, rel);
+    return rel < 1e-4 ? 0 : 1;
+}
+
 // Build every kernel on the selected device and report what the driver compiled it to.
 static int cmd_kernels(int argc, char **argv) {
     std::string only, device; bool code = false; uint32_t subgroup = 0; std::vector<uint32_t> spec;
@@ -279,6 +323,7 @@ int main(int argc, char **argv) {
         if (argc >= 2 && !strcmp(argv[1], "compare")) return cmd_compare(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "devices")) return cmd_devices();
         if (argc >= 2 && !strcmp(argv[1], "kernels")) return cmd_kernels(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "test-matvec")) return cmd_test_matvec(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "tokenize")) return cmd_tokenize(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "dequant-raw")) return cmd_dequant_raw(argc - 2, argv + 2);
         fprintf(stderr, "usage: gfxi <command> ...\n  info <model.gguf> [--tensors]   show model metadata and weight encodings\n"
