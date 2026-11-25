@@ -34,6 +34,8 @@ foreach(fmt Q4_K Q5_K Q6_K Q3_K IQ4_XS IQ4_NL Q4_0 Q8_0 NVFP4 IQ3_S IQ3_XXS IQ2_
   string(TOLOWER ${fmt} fmt_lower)
   gfx_shader(matvec_${fmt_lower} matvec_q.comp FMT_${fmt})
   gfx_shader(matmat_${fmt_lower} matvec_q.comp FMT_${fmt} BATCH)
+  gfx_shader(wmma_${fmt_lower} matvec_q.comp FMT_${fmt} WMMA)
+  gfx_shader(wmmaemu_${fmt_lower} matvec_q.comp FMT_${fmt} WMMA WMMA_EMU)
 endforeach()
 gfx_shader(blocksum blocksum.comp)
 gfx_shader(memread memread.comp)
@@ -51,6 +53,7 @@ gfx_shader(dn_prep dn_prep.comp)
 gfx_shader(dn_update dn_update.comp)
 gfx_shader(dn_hist dn_hist.comp)
 gfx_shader(matmat_f16 matmat_f16.comp)
+gfx_shader(to_f16 to_f16.comp)
 gfx_shaders_finish()
 
 add_library(gfxgpu STATIC

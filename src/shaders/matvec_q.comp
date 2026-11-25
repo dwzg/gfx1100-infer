@@ -12,15 +12,43 @@
 // tile). Each weight is loaded and decoded once and multiplied into T accumulators, so the
 // per-token cost is one multiply-add per weight. The format code below is written against a
 // small set of accumulator operations that are scalar or T-wide.
+//
+// WMMA builds the matrix-matrix form on the card's matrix instructions (cooperative matrices):
+// each workgroup decodes 256 columns of its 64 rows into half precision in shared memory, then
+// multiplies 16x16 tiles of that against 16x16 tiles of the half-precision inputs of 16 tokens,
+// accumulating in single precision. The same format code runs with the accumulator operations
+// redefined to emit decoded weights instead of summing products.
 #include "common.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// WMMA_EMU replaces only the matrix calls with plain arithmetic, so everything else in that path
+// (decoding into shared memory, tiling, half-precision inputs) can be tested on any device.
+#if defined(WMMA) && !defined(WMMA_EMU)
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#endif
 layout(local_size_x = 64) in;
 layout(binding = 0) readonly buffer BW { uint w[]; };
+#ifdef WMMA
+layout(binding = 1) readonly buffer BX { float16_t xh[]; };   // inputs, half precision, [token][n_in]
+#else
 layout(binding = 1) readonly buffer BX { float x[]; };
+#endif
 layout(binding = 2) readonly buffer BXS { float xs[]; };
+#ifdef WMMA
+layout(binding = 3) buffer BY { float y[]; };
+#else
 layout(binding = 3) writeonly buffer BY { float y[]; };
+#endif
 layout(binding = 4) readonly buffer BB { float bias[]; };
-#ifdef BATCH
+#if defined(WMMA)
+layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; uint n_tokens; uint x_stride; uint xs_stride; uint y_stride; } pc;
+#define CHUNK 256u                 // columns decoded per step
+shared float16_t wbuf[64u * CHUNK];
+uint g_lrow, g_col0;               // this lane's row offset in wbuf; first column of the current chunk
+struct Cols { uint lo; uint hi; }; // a run of columns of the current chunk
+#define ACC Cols
+#elif defined(BATCH)
 #define T 4u
 layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; uint n_tokens; uint x_stride; uint xs_stride; uint y_stride; } pc;
 uint g_x0, g_s0;                   // offsets of the tile's first token in x and xs
@@ -42,6 +70,43 @@ layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row
 #define BYTE(v, i) (((v) >> (8u * (i))) & 0xFFu)
 uint g_base;                       // index of word 0 of the current super-block for this lane
 #define LW(k) w[g_base + (k) * pc.stride]
+// Codes of some formats are stored with a bias so they are unsigned. The summing kernels remove
+// it through the block sums (acc_bias); the WMMA kernel subtracts it from each code, exactly.
+#if defined(FMT_Q8_0)
+#define CODE_BIAS 128.0
+#elif defined(FMT_IQ4_XS) || defined(FMT_IQ4_NL)
+#define CODE_BIAS 127.0
+#elif defined(FMT_Q6_K)
+#define CODE_BIAS 32.0
+#elif defined(FMT_NVFP4)
+#define CODE_BIAS 12.0
+#elif defined(FMT_Q4_0)
+#define CODE_BIAS 8.0
+#elif defined(FMT_Q3_K)
+#define CODE_BIAS 4.0
+#else
+#define CODE_BIAS 0.0
+#endif
+
+#ifdef WMMA
+float g_tot;                       // unused; keeps the format code identical
+ACC acc_zero() { return Cols(0xFFFFFFFFu, 0u); }
+// Emit four codes (bias removed) for columns xb..xb+3 of this lane's row.
+void acc_mul4(inout ACC a, vec4 f, uint xb) {
+    uint c = xb - g_col0;
+    a.lo = min(a.lo, c); a.hi = max(a.hi, c + 4u);
+    wbuf[g_lrow + c] = float16_t(f.x - CODE_BIAS); wbuf[g_lrow + c + 1u] = float16_t(f.y - CODE_BIAS);
+    wbuf[g_lrow + c + 2u] = float16_t(f.z - CODE_BIAS); wbuf[g_lrow + c + 3u] = float16_t(f.w - CODE_BIAS);
+}
+void acc_dot4(inout ACC a, uint v, uint xb) { acc_mul4(a, vec4(float(v & 0xFFu), float((v >> 8) & 0xFFu), float((v >> 16) & 0xFFu), float(v >> 24)), xb); }
+// Scale the emitted run of columns.
+void acc_axpy(inout float tot, float s, ACC a) { for (uint c = a.lo; c < a.hi; c++) wbuf[g_lrow + c] = float16_t(float(wbuf[g_lrow + c]) * s); }
+// Add a constant to the weights of a 16-column / 32-column block (the formats with a separate minimum).
+void acc_xs(inout float tot, float k, uint b) { uint c = 16u * b - g_col0; for (uint i = 0u; i < 16u; i++) wbuf[g_lrow + c + i] = float16_t(float(wbuf[g_lrow + c + i]) + k); }
+void acc_xs32(inout float tot, float k, uint b) { uint c = 16u * b - g_col0; for (uint i = 0u; i < 32u; i++) wbuf[g_lrow + c + i] = float16_t(float(wbuf[g_lrow + c + i]) + k); }
+void acc_bias(inout float tot, float f, uint b) {}
+void acc_bias32(inout float tot, float f, uint b) {}
+#else
 ACC g_tot;                         // the row's running result
 
 ACC acc_zero() { ACC a; FOR_T A(a) = 0.0; return a; }
@@ -53,6 +118,10 @@ void acc_axpy(inout ACC y_, float s, ACC a) { FOR_T A(y_) += s * A(a); }
 // a += k * (sum of x over the 16-column block b)      /  over the 32 columns starting at block b
 void acc_xs(inout ACC a, float k, uint b) { FOR_T A(a) += k * XS(b); }
 void acc_xs32(inout ACC a, float k, uint b) { FOR_T A(a) += k * (XS(b) + XS(b + 1u)); }
+// Remove the code bias of a block whose scale is f: a -= CODE_BIAS * f * (block sum of x)
+void acc_bias(inout ACC a, float f, uint b) { acc_xs(a, -CODE_BIAS * f, b); }
+void acc_bias32(inout ACC a, float f, uint b) { acc_xs32(a, -CODE_BIAS * f, b); }
+#endif
 
 #if defined(FMT_IQ4_XS) || defined(FMT_IQ4_NL) || defined(FMT_NVFP4)
 // 16-entry codebooks, stored biased so every entry is an unsigned byte.
@@ -136,7 +205,7 @@ void superblock(uint xb) {
                 }
                 uint si = 8u * n + is + 2u * q;       // scale / 16-column block index
                 float f = d * scale8(si);
-                acc_axpy(g_tot, f, a); acc_xs(g_tot, -32.0 * f, sx + si);
+                acc_axpy(g_tot, f, a); acc_bias(g_tot, f, sx + si);
             }
 }
 #elif defined(FMT_Q3_K)
@@ -160,7 +229,7 @@ void superblock(uint xb) {
                 }
                 uint is = 8u * n + 2u * j + hh;
                 float f = d * float(int(BYTE(sw[is >> 2], is & 3u)) - 32);
-                acc_axpy(g_tot, f, a); acc_xs(g_tot, -4.0 * f, sx + is);
+                acc_axpy(g_tot, f, a); acc_bias(g_tot, f, sx + is);
             }
 }
 #elif defined(FMT_IQ4_XS)
@@ -178,7 +247,7 @@ void superblock(uint xb) {
         }
         uint ls = ((sl >> (4u * ib)) & 15u) | (((w0 >> (16u + 2u * ib)) & 3u) << 4);
         float f = d * float(int(ls) - 32);
-        acc_axpy(g_tot, f, a); acc_xs32(g_tot, -127.0 * f, sx + 2u * ib);
+        acc_axpy(g_tot, f, a); acc_bias32(g_tot, f, sx + 2u * ib);
     }
 }
 #elif defined(FMT_IQ4_NL) || defined(FMT_Q4_0)
@@ -199,11 +268,7 @@ void superblock(uint xb) {
 #endif
         }
         acc_axpy(g_tot, dd[blk], a);
-#if defined(FMT_IQ4_NL)
-        acc_xs32(g_tot, -127.0 * dd[blk], sx + 2u * blk);
-#else
-        acc_xs32(g_tot, -8.0 * dd[blk], sx + 2u * blk);
-#endif
+        acc_bias32(g_tot, dd[blk], sx + 2u * blk);
     }
 }
 #elif defined(FMT_Q8_0)
@@ -216,7 +281,7 @@ void superblock(uint xb) {
     for (uint blk = 0u; blk < 2u; blk++) {
         ACC a = acc_zero();
         for (uint k = 0u; k < 8u; k++) acc_dot4(a, LW(1u + 8u * blk + k), xb + 32u * blk + 4u * k);
-        acc_axpy(g_tot, dd[blk], a); acc_xs32(g_tot, -128.0 * dd[blk], sx + 2u * blk);
+        acc_axpy(g_tot, dd[blk], a); acc_bias32(g_tot, dd[blk], sx + 2u * blk);
     }
 }
 #elif defined(FMT_NVFP4)
@@ -237,7 +302,7 @@ void superblock(uint xb) {
             acc_dot4c(a, v & M4, c); acc_dot4c(a, (v >> 4) & M4, c + 8u);
         }
         float f = ue4m3_half(BYTE(w0, s));
-        acc_axpy(g_tot, f, a); acc_xs(g_tot, -12.0 * f, sx + s);
+        acc_axpy(g_tot, f, a); acc_bias(g_tot, f, sx + s);
     }
 }
 #elif defined(FMT_IQ3_S) || defined(FMT_IQ3_XXS) || defined(FMT_IQ2_S) || defined(FMT_IQ2_XS) || defined(FMT_IQ2_XXS)
@@ -339,6 +404,62 @@ void superblock(uint xb) {
 #error "no weight format selected"
 #endif
 
+#if defined(WMMA) && defined(WMMA_EMU)
+void main() {
+    uint row = gl_GlobalInvocationID.x, t0 = gl_WorkGroupID.y * 16u;
+    g_lrow = gl_LocalInvocationID.x * CHUNK;
+    float acc[16];
+    for (uint t = 0u; t < 16u; t++) acc[t] = 0.0;
+    uint n_chunks = pc.n_sb * SB / CHUNK;
+    for (uint ch = 0u; ch < n_chunks; ch++) {
+        g_col0 = ch * CHUNK;
+        for (uint s = ch * (CHUNK / SB); s < (ch + 1u) * (CHUNK / SB); s++) {
+            g_base = s * NW * pc.stride + row;
+            superblock(s * SB);
+        }
+        barrier();
+        for (uint c = 0u; c < CHUNK; c++) {
+            float wv = float(wbuf[g_lrow + c]);
+            for (uint t = 0u; t < 16u; t++) acc[t] += wv * float(xh[(t0 + t) * pc.x_stride + g_col0 + c]);
+        }
+        barrier();
+    }
+    if (row < pc.n_rows) for (uint t = 0u; t < 16u; t++) y[(t0 + t) * pc.y_stride + pc.row0 + row] = acc[t];
+}
+#elif defined(WMMA)
+void main() {
+    uint row = gl_GlobalInvocationID.x, t0 = gl_WorkGroupID.y * 16u;
+    g_lrow = gl_LocalInvocationID.x * CHUNK;
+    // Each subgroup owns the 16-row tiles rt = gl_SubgroupID, gl_SubgroupID + gl_NumSubgroups, ...
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c[4];
+    for (uint j = 0u; j < 4u; j++) c[j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    uint n_chunks = pc.n_sb * SB / CHUNK;
+    for (uint ch = 0u; ch < n_chunks; ch++) {
+        g_col0 = ch * CHUNK;
+        for (uint s = ch * (CHUNK / SB); s < (ch + 1u) * (CHUNK / SB); s++) {
+            g_base = s * NW * pc.stride + row;
+            superblock(s * SB);
+        }
+        barrier();
+        for (uint kt = 0u; kt < CHUNK / 16u; kt++) {
+            // A: inputs, (token, column). B: decoded weights, (column, row) - one row of wbuf per weight row.
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+            coopMatLoad(a, xh, t0 * pc.x_stride + g_col0 + 16u * kt, pc.x_stride, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint rt = gl_SubgroupID, j = 0u; rt < 4u; rt += gl_NumSubgroups, j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+                coopMatLoad(b, wbuf, rt * 16u * CHUNK + 16u * kt, CHUNK, gl_CooperativeMatrixLayoutColumnMajor);
+                c[j] = coopMatMulAdd(a, b, c[j]);
+            }
+        }
+        barrier();
+    }
+    // (token, row) results for 16 tokens and this subgroup's row tiles.
+    uint rows0 = gl_WorkGroupID.x * 64u;
+    for (uint rt = gl_SubgroupID, j = 0u; rt < 4u; rt += gl_NumSubgroups, j++)
+        if (rows0 + 16u * rt < pc.n_rows)
+            coopMatStore(c[j], y, t0 * pc.y_stride + pc.row0 + rows0 + 16u * rt, pc.y_stride, gl_CooperativeMatrixLayoutRowMajor);
+}
+#else
 void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= pc.stride) return;
@@ -359,3 +480,4 @@ void main() {
     y[pc.row0 + row] = g_tot + bv;
 #endif
 }
+#endif

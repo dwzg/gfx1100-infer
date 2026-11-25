@@ -20,8 +20,11 @@ class GpuModel {
     // n_ctx <= 0: use as much context as fits in the GPU memory that is free after loading the
     //      weights (capped at the model's trained context), keeping `reserve_bytes` unallocated.
     // batch: how many prompt tokens are processed together (1 disables batching).
-    GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16 = false, bool kv8 = false, uint64_t reserve_bytes = 256ull << 20, int batch = 32);
+    GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16 = false, bool kv8 = false, uint64_t reserve_bytes = 256ull << 20, int batch = 32, bool allow_wmma = true);
     int batch() const { return batch_; }
+    // Which weight formats passed the on-device check of the matrix-instruction kernels (empty if
+    // the device has none, or they are disabled).
+    const std::string &wmma_report() const { return wmma_report_; }
     // GPU bytes one token of context costs, for a given cache type.
     static uint64_t bytes_per_token(const ModelDesc &d, bool kv8);
     ~GpuModel();
@@ -52,10 +55,12 @@ class GpuModel {
         const struct PackFormat *fmt = nullptr;  // native quantised layout, or nullptr for fp16 rows
         std::vector<Buffer> chunks;       // consecutive row ranges
         std::vector<uint32_t> chunk_rows; // rows in each chunk (its plane stride is rows rounded up to 64)
+        std::vector<uint32_t> chunk_stride;  // optional explicit plane stride (when only some rows are computed)
+        uint32_t stride(size_t c) const { return c < chunk_stride.size() ? chunk_stride[c] : (chunk_rows[c] + 63) / 64 * 64; }
         Buffer bias;                      // fp32, optional
     };
     // An activation vector that feeds matrix products, with its 16-column block sums.
-    struct Vec { Buffer v, s; uint32_t n = 0; };
+    struct Vec { Buffer v, s, h; uint32_t n = 0; };   // h: half-precision copy (matrix-instruction path only)
     struct Layer {
         bool recurrent = false;
         Buffer attn_norm, ffn_norm, qk_norm;
@@ -70,6 +75,10 @@ class GpuModel {
     Vec scratch_vec(uint64_t n);
     // y[t] = M x[t] for the first n_tokens vectors of x; y holds vectors of m.n_out elements.
     void matmul(Program &p, const Matrix &m, const Vec &x, const Buffer &y, uint32_t n_tokens);
+    bool use_wmma(const Matrix &m, uint32_t n_tokens) const;
+    void dispatch_wmma(Program &p, const Matrix &m, size_t chunk, uint32_t row0, const Buffer &xh, const Buffer &y, uint32_t n_tokens);
+    void to_half(Program &p, const Vec &x, uint64_t n);
+    void verify_wmma();
     void alloc_activations();
     Program &program(int n_tokens);
     void eval_batch(const int32_t *tokens, int n);
@@ -90,6 +99,10 @@ class GpuModel {
     struct Act { Buffer x, a, g, u, qfull, kraw, vraw, q, gate, scores, zsum, part, mixed, z, alpha, beta, qkv, dn_o, logits; Vec h, act, mix, dn_on, h_last; } act_;
     int batch_ = 1, batch_cap_ = 8, q_batch_ = 1;   // tokens per batch; allocated capacity; queries scored together
     uint32_t part_stride_ = 0;
+    bool wmma_ = false;                    // device has the matrix instructions and they are allowed
+    bool wmma_emu_ = false;                // testing: run that path with the matrix calls emulated
+    std::vector<uint32_t> wmma_ok_;        // tensor types whose kernel passed the on-device check
+    std::string wmma_report_;
     std::map<int, std::unique_ptr<Program>> programs_;   // by number of tokens
     std::vector<float> logits_;
     uint64_t weight_bytes_ = 0, state_bytes_ = 0;

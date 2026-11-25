@@ -232,6 +232,7 @@ static int cmd_run(int argc, char **argv) {
         dev = std::make_unique<Device>(device == "gpu" ? "" : device);
         fprintf(stderr, "[%s] loading %s ...\n", dev->caps().name.c_str(), desc.name.c_str());
         gpu = std::make_unique<GpuModel>(*dev, g, desc, ctx_max ? 0 : n_ctx, false, kv8, (uint64_t)(reserve_gib * 1073741824.0), batch);
+        if (dev->caps().coop_matrix) fprintf(stderr, "[matrix instructions verified for: %s]\n", gpu->wmma_report().empty() ? "(disabled)" : gpu->wmma_report().c_str());
         if ((int)ids.size() >= gpu->n_ctx()) throw std::runtime_error("the prompt (" + std::to_string(ids.size()) + " tokens) does not fit the context (" + std::to_string(gpu->n_ctx()) + ")");
         fprintf(stderr, "[%s] weights %.2f GiB, context %d tokens (%s cache, %.2f GiB), %zu dispatches and %zu sync points per token, %d prompt tokens\n", dev->caps().name.c_str(),
                 gpu->weight_bytes() / 1073741824.0, gpu->n_ctx(), kv8 ? "8-bit" : "half-precision", gpu->state_bytes() / 1073741824.0, gpu->dispatches_per_token(), gpu->barriers_per_token(), (int)ids.size());
@@ -312,6 +313,7 @@ static int cmd_chat(int argc, char **argv) {
     Device dev(device);
     fprintf(stderr, "[%s] loading %s ...\n", dev.caps().name.c_str(), desc.name.c_str());
     GpuModel gpu(dev, g, desc, ctx_max ? 0 : n_ctx, false, kv8, (uint64_t)(reserve_gib * 1073741824.0), batch);
+    if (dev.caps().coop_matrix) fprintf(stderr, "[matrix instructions verified for: %s]\n", gpu.wmma_report().empty() ? "(disabled)" : gpu.wmma_report().c_str());
     Sampler sampler(sp);
     bool first = true;
     if (!load_path.empty()) { gpu.load_state(load_path); first = false; fprintf(stderr, "[restored %d tokens of context]\n", gpu.n_past()); }
@@ -377,6 +379,7 @@ static int cmd_compare(int argc, char **argv) {
     Device dev(device);
     GpuModel gpu(dev, g, desc, n_ctx, fp16, kv8, 256ull << 20, batch);
     printf("weights on device: %.3f GiB\n", gpu.weight_bytes() / 1073741824.0);
+    if (!gpu.wmma_report().empty()) printf("matrix-instruction kernels verified for: %s\n", gpu.wmma_report().c_str());
     RefModel ref(g, desc, n_ctx, (int)std::thread::hardware_concurrency());
     if (skip > 0) { gpu.skip_to(skip); ref.skip_to(skip); }
     printf("device %s, model %s, %zu prompt tokens + %d generated, starting at position %d\n", dev.caps().name.c_str(), desc.name.c_str(), ids.size(), n_extra, skip);
@@ -416,7 +419,7 @@ static int cmd_devices() {
 // Device benchmark: achievable memory bandwidth, the throughput of each quantised matvec kernel
 // relative to it, and the fixed cost of a dispatch. With a model: tokens per second.
 static int cmd_bench(int argc, char **argv) {
-    std::string device, model; uint64_t mib = 512; uint32_t wave = 0; int n_tokens = 32; bool kv8 = false;
+    std::string device, model; uint64_t mib = 512; uint32_t wave = 0; int n_tokens = 64, batch = 32; bool kv8 = false, no_wmma = false;
     for (int i = 0; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
@@ -425,6 +428,8 @@ static int cmd_bench(int argc, char **argv) {
         else if (a == "--wave") wave = (uint32_t)atoi(next());
         else if (a == "-n") n_tokens = atoi(next());
         else if (a == "--kv8") kv8 = true;
+        else if (a == "--batch") batch = atoi(next());
+        else if (a == "--no-wmma") no_wmma = true;
         else model = a;
     }
     Device dev(device);
@@ -435,15 +440,29 @@ static int cmd_bench(int argc, char **argv) {
         ModelDesc desc = describe_model(g);
         int n_ctx = n_tokens + 8;
         auto t0 = std::chrono::steady_clock::now();
-        GpuModel gpu(dev, g, desc, n_ctx, false, kv8);
+        GpuModel gpu(dev, g, desc, n_ctx, false, kv8, 256ull << 20, batch, !no_wmma);
         printf("%s: loaded in %.1f s, weights %.2f GiB, %zu dispatches and %zu sync points per token\n", desc.name.c_str(), seconds_since(t0),
                gpu.weight_bytes() / 1073741824.0, gpu.dispatches_per_token(), gpu.barriers_per_token());
+        if (dev.caps().coop_matrix) printf("matrix-instruction kernels verified for: %s\n", gpu.wmma_report().empty() ? "(disabled)" : gpu.wmma_report().c_str());
         std::vector<int32_t> toks(n_tokens);
         for (int i = 0; i < n_tokens; i++) toks[i] = (int32_t)((1000003ull * (i + 1)) % (uint64_t)desc.n_vocab);
-        gpu.eval(toks.data(), 2);   // warm-up
+        // Prompt speed: whole batches.
+        int np = std::max(1, n_tokens / gpu.batch()) * gpu.batch();
+        if (np <= n_tokens && gpu.batch() > 1) {
+            gpu.eval(toks.data(), gpu.batch()); gpu.reset();   // warm-up: builds the batch program
+            t0 = std::chrono::steady_clock::now();
+            gpu.eval(toks.data(), np);
+            double dt = seconds_since(t0);
+            printf("prompt speed:     %.1f tok/s  (%d tokens in batches of %d)\n", np / dt, np, gpu.batch());
+            gpu.reset();
+        }
+        // Generation speed: one token per submission.
+        int ng = std::min(n_tokens, 34);
         t0 = std::chrono::steady_clock::now();
-        gpu.eval(toks.data() + 2, n_tokens - 2);
-        double dt = seconds_since(t0) / (n_tokens - 2);
+        for (int i = 0; i < 2; i++) gpu.eval(toks.data() + i, 1);   // warm-up
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 2; i < ng; i++) gpu.eval(toks.data() + i, 1);
+        double dt = seconds_since(t0) / (ng - 2);
         printf("generation speed: %.2f ms per token = %.1f tok/s  (reads %.2f GiB per token -> %.0f GB/s effective)\n", dt * 1e3, 1.0 / dt,
                gpu.weight_bytes() / 1073741824.0, gpu.weight_bytes() / dt / 1e9);
         return 0;
@@ -497,8 +516,10 @@ static int cmd_bench(int argc, char **argv) {
     return 0;
 }
 
-// Check one quantised matvec kernel against the scalar decoder, on raw block data of the given
-// type laid out as a matrix with n_in columns and a random input vector.
+// Check the kernels of one weight format against the scalar decoder, on raw block data of the
+// given type laid out as a matrix with n_in columns and random input vectors: the single-vector
+// kernel, the batched kernel, and the matrix-instruction kernel (emulated, and real where the
+// device has the instructions).
 static int cmd_test_matvec(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: gfxi test-matvec <type-id> <blocks.bin> <n_in> [--device name]\n"); return 2; }
     uint32_t type = (uint32_t)atoi(argv[0]), n_in = (uint32_t)atoi(argv[2]);
@@ -510,39 +531,64 @@ static int cmd_test_matvec(int argc, char **argv) {
     std::vector<uint8_t> in; uint8_t buf[65536]; size_t r;
     while ((r = fread(buf, 1, sizeof buf, f)) > 0) in.insert(in.end(), buf, buf + r);
     fclose(f);
+    const uint32_t NT = 16;   // tokens
     uint64_t row_bytes = (uint64_t)n_in / ti->block_elems * ti->block_bytes;
-    uint32_t rows = (uint32_t)(in.size() / row_bytes), stride = (rows + 63) / 64 * 64;
-    if (rows == 0) { fprintf(stderr, "not enough data for one row\n"); return 1; }
-    std::vector<float> x(n_in), xs(n_in / 16), want(rows), wrow(n_in), got(rows);
+    uint32_t rows = (uint32_t)(in.size() / row_bytes) / 16 * 16, stride = (rows + 63) / 64 * 64;
+    if (rows == 0) { fprintf(stderr, "not enough data for 16 rows\n"); return 1; }
+    std::vector<float> x((size_t)NT * n_in), xs((size_t)NT * n_in / 16), want((size_t)NT * rows), wrow(n_in), got((size_t)NT * rows);
+    std::vector<uint16_t> xh(x.size());
     uint32_t seed = 12345;
     for (auto &v : x) { seed = seed * 1664525u + 1013904223u; v = ((seed >> 8) & 0xFFFF) / 32768.0f - 1.0f; }
-    for (uint32_t b = 0; b < n_in / 16; b++) { float t = 0; for (int i = 0; i < 16; i++) t += x[16 * b + i]; xs[b] = t; }
+    for (size_t b = 0; b < xs.size(); b++) { float t = 0; for (int i = 0; i < 16; i++) t += x[16 * b + i]; xs[b] = t; }
+    for (size_t i = 0; i < x.size(); i++) xh[i] = fp32_to_fp16(x[i]);
     double ref_norm = 0;
     for (uint32_t row = 0; row < rows; row++) {
         dequantize(type, in.data() + row * row_bytes, wrow.data(), n_in);
-        double t = 0; for (uint32_t i = 0; i < n_in; i++) t += (double)wrow[i] * x[i];
-        want[row] = (float)t; ref_norm += t * t;
+        for (uint32_t t = 0; t < NT; t++) {
+            double acc = 0; const float *xt = &x[(size_t)t * n_in];
+            for (uint32_t i = 0; i < n_in; i++) acc += (double)wrow[i] * xt[i];
+            want[(size_t)t * rows + row] = (float)acc; ref_norm += acc * acc;
+        }
     }
     Device dev(device);
     uint64_t words = (uint64_t)(n_in / pf->sb_cols) * pf->sb_words * stride;
     std::vector<uint32_t> packed(words);
     pack_rows(*pf, in.data(), n_in, 0, rows, stride, packed.data());
-    Buffer bw = dev.alloc(words * 4), bx = dev.alloc(n_in * 4ull), bxs = dev.alloc(xs.size() * 4), by = dev.alloc(stride * 4ull), dummy = dev.alloc(256);
-    dev.upload(bw, packed.data(), words * 4); dev.upload(bx, x.data(), n_in * 4ull); dev.upload(bxs, xs.data(), xs.size() * 4); dev.fill_zero(dummy);
-    struct { uint32_t n_sb, stride, n_rows, row0, flags; } pc{n_in / pf->sb_cols, stride, rows, 0, 0};
-    std::vector<Binding> binds{R(bw), R(bx), R(bxs), W(by), R(dummy)};
-    if (pf->needs_table) {
-        uint32_t count; const uint32_t *data = pack_table(*pf, &count);
-        Buffer bt = dev.alloc(count * 4ull); dev.upload(bt, data, count * 4ull); binds.push_back(R(bt));
+    Buffer bw = dev.alloc(words * 4), bx = dev.alloc(x.size() * 4), bxs = dev.alloc(xs.size() * 4), bxh = dev.alloc(xh.size() * 2), by = dev.alloc(got.size() * 4), dummy = dev.alloc(256);
+    dev.upload(bw, packed.data(), words * 4); dev.upload(bx, x.data(), x.size() * 4); dev.upload(bxs, xs.data(), xs.size() * 4); dev.upload(bxh, xh.data(), xh.size() * 2); dev.fill_zero(dummy);
+    Buffer bt;
+    if (pf->needs_table) { uint32_t count; const uint32_t *data = pack_table(*pf, &count); bt = dev.alloc(count * 4ull); dev.upload(bt, data, count * 4ull); }
+    struct PcBatch { uint32_t n_sb, stride, n_rows, row0, flags, n_tokens, x_stride, xs_stride, y_stride; } pb{n_in / pf->sb_cols, stride, rows, 0, 0, NT, n_in, n_in / 16, rows};
+    struct { uint32_t n_sb, stride, n_rows, row0, flags; } p1{n_in / pf->sb_cols, stride, rows, 0, 0};
+    std::string base = pf->kernel + 6;   // "matvec_x" -> "_x"
+    int failed = 0;
+    auto check = [&](const char *what, const std::string &kernel, bool batch, bool half, uint32_t tile, double tol) {
+        dev.fill_zero(by);
+        std::vector<Binding> binds{R(bw), R(half ? bxh : bx), R(bxs), W(by), R(dummy)};
+        if (bt.valid()) binds.push_back(R(bt));
+        Program p(dev);
+        if (batch) p.dispatch(dev.pipeline(kernel), binds, &pb, sizeof pb, stride / 64, (NT + tile - 1) / tile);
+        else p.dispatch(dev.pipeline(kernel), binds, &p1, sizeof p1, stride / 64);
+        p.finish(); p.run();
+        size_t n = batch ? got.size() : rows;
+        dev.download(by, got.data(), n * 4);
+        double err = 0, norm = 0;
+        for (size_t i = 0; i < n; i++) { double d = (double)got[i] - want[i]; err += d * d; norm += (double)want[i] * want[i]; }
+        double rel = std::sqrt(err / std::max(norm, 1e-30));
+        bool ok = rel < tol;
+        printf("%s %-7s %-28s %u rows x %u columns, relative error %.2e\n", ok ? "ok  " : "FAIL", ti->name, what, rows, n_in, rel);
+        failed += !ok;
+    };
+    check("single vector", pf->kernel, false, false, 1, 1e-4);
+    check("batched (16 vectors)", "matmat" + base, true, false, 4, 1e-4);
+    if (n_in % 256 == 0) {
+        // half-precision weights and inputs: expect about 1e-3
+        check("matrix path, emulated", "wmmaemu" + base, true, true, 16, 5e-3);
+        if (dev.caps().coop_matrix) check("matrix instructions", "wmma" + base, true, true, 16, 5e-3);
+        else printf("     %-7s matrix instructions          skipped: the device does not have them\n", ti->name);
     }
-    Program p(dev);
-    p.dispatch(dev.pipeline(pf->kernel), binds, &pc, sizeof pc, stride / 64);
-    p.finish(); p.run();
-    dev.download(by, got.data(), rows * 4ull);
-    double err = 0; for (uint32_t i = 0; i < rows; i++) { double d = (double)got[i] - want[i]; err += d * d; }
-    double rel = std::sqrt(err / std::max(ref_norm, 1e-30));
-    printf("%s %s: %u rows x %u columns, relative error %.2e\n", rel < 1e-4 ? "ok  " : "FAIL", ti->name, rows, n_in, rel);
-    return rel < 1e-4 ? 0 : 1;
+    (void)ref_norm;
+    return failed ? 1 : 0;
 }
 
 // Build every kernel on the selected device and report what the driver compiled it to.
@@ -562,6 +608,7 @@ static int cmd_kernels(int argc, char **argv) {
     int failed = 0;
     for (const ShaderBlob &b : all_shaders()) {
         if (!only.empty() && only != b.name) continue;
+        if (!strncmp(b.name, "wmma_", 5) && !dev.caps().coop_matrix) { printf("== %s: skipped (the device has no cooperative-matrix support)\n", b.name); continue; }
         // Kernels whose workgroup size is a specialization constant need one to compile.
         std::vector<uint32_t> sp = spec;
         if (sp.empty() && (!strcmp(b.name, "attn_prep") || !strncmp(b.name, "dn_", 3))) sp = {128};
@@ -594,7 +641,7 @@ int main(int argc, char **argv) {
                         "  chat <model.gguf>               interactive chat, one line per turn\n"
                         "  devices                         list Vulkan devices and the features this engine uses\n"
                         "  compare <model.gguf>            check the GPU engine against the CPU reference\n"
-                        "  bench [model.gguf] [--wave 32|64]  memory roofline and kernel throughput; with a model, tokens per second\n"
+                        "  bench [model.gguf] [--wave 32|64]  memory roofline and kernel throughput; with a model, prompt and generation tok/s\n"
                         "  kernels [name] [--code]         compile every kernel on the device; --code prints the machine code\n"
                         "  tokenize <model.gguf> <text|@file>  print token ids\n");
         return 2;

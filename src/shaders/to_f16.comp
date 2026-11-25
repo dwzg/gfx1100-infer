@@ -1,0 +1,15 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Half-precision copy of a vector, saturating at the largest finite half. Input for the
+// matrix-instruction kernels.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer BX { float x[]; };
+layout(binding = 1) writeonly buffer BH { uint h[]; };   // two halves per word
+layout(push_constant) uniform PC { uint n; } pc;
+void main() {
+    uint i = 2u * gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    vec2 v = clamp(vec2(x[i], i + 1u < pc.n ? x[i + 1u] : 0.0), vec2(-65504.0), vec2(65504.0));
+    h[i >> 1] = packHalf2x16(v);
+}
