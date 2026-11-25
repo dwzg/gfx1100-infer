@@ -20,8 +20,10 @@ container without a GPU. Nothing in this repository is a measured 7900 XTX speed
 | Attention cache | Half precision, or 8-bit with `--kv8`; context sized automatically with `--ctx max` |
 | Saving and restoring a processed context | `--save-state` / `--load-state` |
 | Inkling 2 Mini (`inkling2_loop`) | **Not yet.** Its weight format and tokenizer are supported; its model graph is not |
-| Batched prompt processing | **Not yet.** Prompt tokens are processed one at a time, at generation speed |
-| Images, chat templates beyond ChatML, YaRN context extension, SentencePiece vocabularies | Not yet |
+| Batched prompt processing | Yes: prompt tokens go through in batches (default 32) with weights decoded once per 4-token tile |
+| Matrix instructions (WMMA) for prompts | Written and compiled for the card, **never executed**; enabled per weight format only if an automatic on-device check passes |
+| Interactive chat | `gfxi chat`, ChatML-style templates only, with `--system` and `--no-think` |
+| Images, chat templates other than ChatML, YaRN context extension, SentencePiece vocabularies | Not yet |
 
 ## Build
 
@@ -42,10 +44,11 @@ the version checked here.
 build/gfxi devices                          # which device, and which hardware features are usable
 build/gfxi plan  model.gguf --vram 24       # GPU memory needed and how much context fits
 build/gfxi run   model.gguf --chat -p "Why is the sky blue?" -n 200
+build/gfxi chat  model.gguf --kv8 --ctx max                 # interactive, context kept between turns
 build/gfxi run   model.gguf --kv8 --ctx max -p @long_prompt.txt --save-state doc.ctx   # process once
 build/gfxi run   model.gguf --kv8 --load-state doc.ctx --chat -p "Summarise it."         # reuse
 build/gfxi bench                            # memory roofline, kernel throughput, dispatch cost
-build/gfxi bench model.gguf                 # tokens per second
+build/gfxi bench model.gguf                 # prompt and generation tokens per second
 build/gfxi compare model.gguf               # GPU engine vs. CPU reference, logit by logit
 build/gfxi kernels matvec_q4_k --code       # the machine code the driver generated for a kernel
 ```
@@ -77,8 +80,9 @@ desktop. Going past 262,144 would need YaRN position scaling, which is not imple
 
 Two things to know before relying on a very long context:
 
-- **Filling it is slow for now.** Prompt tokens are processed one at a time, so a 200,000-token
-  prompt takes as long as generating 200,000 tokens. Save it once with `--save-state`.
+- **Filling it takes a while.** Prompts are processed in batches, but how fast that is on the real
+  card is unmeasured, and the linear-attention layers still walk the tokens in order. Save a long
+  prompt once with `--save-state` and reuse it.
 - **Generation slows down as the context fills**, because the whole cache is read for every token.
   Upper bounds from the card's 960 GB/s memory bandwidth for `UD-Q4_K_S` (not predictions):
   64 tok/s at 4K tokens, 49 tok/s at 131K and 40 tok/s at 262K with the 8-bit cache.
@@ -105,9 +109,13 @@ weight exactly once per token, as cheaply as possible:
 - *Per-block offsets stay out of the inner loop.* Every format decodes as
   `scale * (code - offset)`; the offset term only needs the sum of the input over the block,
   which is computed once per input vector.
-- *One submission per token.* The whole forward pass is recorded once as a command buffer and
-  resubmitted; position-dependent values come from a small host buffer. Sync points are placed
-  only where one dispatch reads what an earlier one wrote.
+- *One submission per token (or per prompt batch).* The forward pass is recorded once per batch
+  size as a command buffer and resubmitted; position-dependent values come from small host
+  buffers. Sync points are placed only where one dispatch reads what an earlier one wrote.
+- *Prompts in batches.* Every kernel takes a token dimension. The matrix kernels are written
+  against a few accumulator operations that are scalar for generation, 4 tokens wide for prompts
+  (each weight decoded once per tile), or emit decoded weights into shared memory for the
+  matrix-instruction path, which multiplies 16x16 tiles for 16 tokens at a time.
 - *The embedding table stays on the CPU* (one row is decoded per token), unless it is also the
   output projection.
 - *The attention cache is read once per token, in parallel.* Keys are stored plane-major like the
@@ -131,14 +139,21 @@ What was checked, and how:
 | GPU engine end to end, 12 model files across 4 architectures | CPU reference | Relative logit error under 2.5e-3, same top token |
 | Long context: a 1,251-token prompt, and a start at position 120,000 over an empty cache | CPU reference | Same top token; relative error 7e-4 (half precision), 6e-3 to 2e-2 (8-bit) |
 | Restored context | Uninterrupted run | Bit-identical logits |
+| Batched prompts (batch sizes 1, 5, 7, 32; forced query sub-batches), all 12 model files | CPU reference | Same results as token-by-token |
+| Batched and emulated matrix-path kernels, all 14 native formats, on real weight samples | Scalar decoder | Relative error about 3e-7 (batched) and 3e-4 (half-precision matrix path) |
 | 8-bit cache | CPU reference | Relative logit error 0.4-0.9% on Qwen 3.5 0.8B; 1-2% on a 135M Llama-style model |
-| Every kernel compiles for the 7900 XTX | RADV 25.2.8 as Navi 31 (no hardware) | All compile, no register spills |
+| Every kernel compiles for the 7900 XTX, including the matrix-instruction ones | RADV 25.2.8 as Navi 31 (no hardware) | All 74 compile, no vector-register spills; the matrix kernels contain `v_wmma_f32_16x16x16_f16` |
 
 Not checked:
 
 - **Anything on a real 7900 XTX.** The GPU path ran only on Mesa's CPU Vulkan driver (lavapipe).
   That exercises the same SPIR-V with a wave size of 8; the real card uses 32 or 64. No kernel
   depends on the wave size for correctness, but that has not been observed on hardware.
+- **The matrix-instruction kernels have never run.** The CPU driver available here lacks the
+  extension (Mesa 26.2 adds it; building a newer one was not possible in the development session).
+  Everything around the three matrix calls is tested through an emulated variant; the calls
+  themselves are not. The engine checks each format on the device before using it, and
+  `gfxi test-matvec` tests them directly.
 - **Agreement with llama.cpp.** Building it as a cross-check was not possible in the development
   session. The decoders and tokenizer were checked against independent implementations; the
   forward pass was checked only by text quality.
@@ -156,16 +171,17 @@ Run the suite with `tests/run_tests.sh <models-dir> [python]`.
 
 In order:
 
-1. `gfxi devices`, then `tests/run_tests.sh` on the real card.
-2. `gfxi bench` and `gfxi bench model.gguf`. This gives the achievable memory bandwidth, each
-   kernel as a fraction of it, and the cost of a dispatch plus sync point.
+1. `gfxi devices`, then `tests/run_tests.sh` on the real card. The `test-matvec` lines labelled
+   "matrix instructions" and the start-up line "matrix instructions verified for: ..." say whether
+   the WMMA kernels are correct there.
+2. `gfxi bench` and `gfxi bench model.gguf` (also with `--no-wmma`). This gives the achievable
+   memory bandwidth, each kernel as a fraction of it, the cost of a dispatch plus sync point, and
+   prompt and generation speed.
 3. Tune from those numbers: wave size, loads in flight per wave, splitting columns across more
-   waves, folding the block-sum pass into the kernels that produce the vector, and a faster
-   codebook lookup for IQ4 and NVFP4 (those kernels currently cost about 3x the arithmetic of
-   Q4_K per weight).
-4. Batched prompt processing using the matrix instructions. Without it a 100K-token prompt takes
-   as long as generating 100K tokens. This is the biggest gap for long-context use.
-5. The Inkling 2 Mini architecture.
+   waves, tokens per tile, a faster codebook lookup for IQ4 and NVFP4 (those kernels currently do
+   about 3x the arithmetic of Q4_K per weight), and folding the half-precision conversion into the
+   kernels that produce each vector.
+4. The Inkling 2 Mini architecture.
 
 ## Layout
 
