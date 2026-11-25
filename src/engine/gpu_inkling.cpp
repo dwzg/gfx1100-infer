@@ -25,8 +25,7 @@ struct PcSoft { uint32_t n_ctx, nh, tq0; };
 struct PcVsum { uint32_t hd, nh, nkv, n_ctx, seg, part_stride, tq0; };
 struct PcCombine { uint32_t hd, nh, seg, flags, part_stride, tq0, n_seg; };
 struct PcRoute { uint32_t n_expert, used; float scale; uint32_t flags, n; };
-struct PcSitu { uint32_t nff; float beta, lb; };
-struct PcExpert { uint32_t n_sb, stride, n_rows, row0, flags, used, x_stride, xs_stride; };
+struct PcExpert { uint32_t n_sb, stride, n_rows, row0, flags, used, x_stride, xs_stride; float p0 = 0, p1 = 0; };
 constexpr uint32_t k_ring_seg = 256;   // places of a sliding-window cache summed per workgroup
 }  // namespace
 
@@ -52,7 +51,7 @@ struct GpuModel::Ink {
     uint32_t ring = 0, ring_segs = 0, table_stride = 0;
     // activations (B = batch capacity)
     Buffer xraw, x, cur, blk[5], pass_out[2], m, ms, msg, low[4], qraw, kraw, vraw, rraw, sink, gate, ktaps, vtaps, q, table, scores, zsum, part;
-    Buffer a, f, ids, wts, gu, act, acts, dn, logits;
+    Buffer a, f, ids, wts, act, acts, dn, logits;
     Vec h[3], hf, mix, h_last;   // m/ms: the mixed attention inputs, normalised, with their block sums; h[j]: the same as vectors (and after the controllers)
 };
 
@@ -79,7 +78,9 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const InklingDesc &desc, int n_ct
     const uint32_t n = D.n_embd, ne = D.n_expert, nff = D.n_ff;
     auto ones = [&](size_t count) { std::vector<float> v(count, 1.0f); Buffer b = dev_.alloc(count * 4); dev_.upload(b, v.data(), count * 4); return b; };
     // All experts of a layer in one buffer, each in the plane-major layout of its format.
-    auto load_experts = [&](const TensorInfo *w, int layer, const PackFormat *&fmt) {
+    // interleave: the first and second half of each expert's rows alternate (gate 0, up 0, gate 1, ...),
+    // which lets the kernel apply the activation to each pair.
+    auto load_experts = [&](const TensorInfo *w, int layer, const PackFormat *&fmt, bool interleave) {
         const uint32_t n_in = (uint32_t)w->dim(0), n_out = (uint32_t)w->dim(1);
         fmt = pack_format(w->type);
         if (!fmt || n_in % fmt->sb_cols || fmt->needs_table) throw std::runtime_error("tensor " + w->name + ": this weight format is not supported for expert matrices yet");
@@ -88,9 +89,19 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const InklingDesc &desc, int n_ct
         if (words * 4 * ne > dev_.caps().max_storage_range) throw std::runtime_error("tensor " + w->name + " is too large for one buffer on this device");
         Buffer b = dev_.alloc(words * 4 * ne);
         std::vector<uint32_t> buf(words);
+        const TypeInfo *ti = type_info(w->type);
+        const uint64_t row_bytes = (uint64_t)n_in / ti->block_elems * ti->block_bytes;
+        std::vector<uint8_t> rows(interleave ? row_bytes * n_out : 0);
         for (uint32_t e = 0; e < ne; e++) {
             if (want_expert && !want_expert(layer, (int)e)) continue;
-            pack_rows(*fmt, w->data, n_in, e * n_out, n_out, stride, buf.data());
+            if (interleave) {
+                const uint8_t *src = w->data + (uint64_t)e * n_out * row_bytes;
+                for (uint32_t r = 0; r < n_out / 2; r++) {
+                    memcpy(&rows[2ull * r * row_bytes], src + (uint64_t)r * row_bytes, row_bytes);
+                    memcpy(&rows[(2ull * r + 1) * row_bytes], src + (uint64_t)(n_out / 2 + r) * row_bytes, row_bytes);
+                }
+                pack_rows(*fmt, rows.data(), n_in, 0, n_out, stride, buf.data());
+            } else pack_rows(*fmt, w->data, n_in, e * n_out, n_out, stride, buf.data());
             dev_.upload(b.sub(e * words * 4, words * 4), buf.data(), words * 4);
         }
         weight_bytes_ += b.size;
@@ -116,7 +127,7 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const InklingDesc &desc, int n_ct
         if (ld.attn_query) l.attn_query = load_vector(ld.attn_query);
         l.ffn_query = load_vector(ld.ffn_query); l.ffn_norm = load_vector(ld.ffn_norm); l.router = load_vector(ld.router);
         if (ld.router_bias) l.router_bias = load_vector(ld.router_bias);
-        l.gate_up = load_experts(ld.gate_up, i, l.gu_fmt); l.down = load_experts(ld.down, i, l.dn_fmt);
+        l.gate_up = load_experts(ld.gate_up, i, l.gu_fmt, true); l.down = load_experts(ld.down, i, l.dn_fmt, false);
         l.gate_up_scale = ld.gate_up_scale ? load_vector(ld.gate_up_scale) : ones(ne);
         l.down_scale = ld.down_scale ? load_vector(ld.down_scale) : ones(ne);
         if (ld.msg_query) {
@@ -168,7 +179,7 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const InklingDesc &desc, int n_ct
     k.part = dev_.alloc(4ull * part_stride_ * q_batch_);
     const uint64_t U = D.n_expert_used;
     k.a = scratch(B * n); k.f = scratch(B * n); k.ids = scratch(B * U); k.wts = scratch(B * U);
-    k.gu = scratch(B * U * 2 * nff); k.act = scratch(B * U * nff); k.acts = scratch(B * U * nff / 16); k.dn = scratch(B * U * n);
+    k.act = scratch(B * U * nff); k.acts = scratch(B * U * nff / 16); k.dn = scratch(B * U * n);
     k.logits = scratch(D.n_vocab_padded);
     if (wmma_) verify_wmma();
     finish_init();
@@ -187,7 +198,7 @@ void GpuModel::record_inkling(Program &p, uint32_t N) {
     const uint64_t n16 = (N + k_wmma_tile - 1) / k_wmma_tile * k_wmma_tile;
 
     const Pipeline *p_norm = dev_.pipeline("norm"), *p_mv32 = dev_.pipeline("matvec_f32"), *p_mix = dev_.pipeline("ink_mix"), *p_ctl_low = dev_.pipeline("ink_ctl_low"),
-                   *p_ctl_out = dev_.pipeline("ink_ctl_out"), *p_conv = dev_.pipeline("ink_conv"), *p_route = dev_.pipeline("ink_route"), *p_situ = dev_.pipeline("ink_situ");
+                   *p_ctl_out = dev_.pipeline("ink_ctl_out"), *p_conv = dev_.pipeline("ink_conv"), *p_route = dev_.pipeline("ink_route");
     const Pipeline *p_prep = dev_.pipeline(kv8_ ? "ink_prep_kv8" : "ink_prep", {hd});
     const Pipeline *p_score = dev_.pipeline(kv8_ ? "ink_score_kv8" : "ink_score", {G}), *p_wscore = dev_.pipeline(kv8_ ? "ink_wscore_kv8" : "ink_wscore", {G});
     const Pipeline *p_soft = dev_.pipeline("ink_soft"), *p_wsoft = dev_.pipeline("ink_wsoft");
@@ -322,13 +333,12 @@ void GpuModel::record_inkling(Program &p, uint32_t N) {
         PcRoute pr{ne, U, D.expert_scale, l.router_bias.valid() ? 1u : 0u, n};
         p.dispatch(p_route, {R(k.hf.v), R(l.router), R(l.router_bias.valid() ? l.router_bias : dummy_), W(k.ids), W(k.wts)}, &pr, sizeof pr, N);
         {
+            // Each chosen expert's gate and up halves, with the activation applied in the kernel.
             const uint32_t rows = 2 * nff, stride = (rows + 63) / 64 * 64;
-            PcExpert pe{n / l.gu_fmt->sb_cols, stride, rows, 0, 0, U, n, n / 16};
-            std::string kernel = std::string("expert") + (l.gu_fmt->kernel + 6);
-            p.dispatch(dev_.pipeline(kernel), {R(l.gate_up), R(k.hf.v), R(k.hf.s), W(k.gu), R(l.gate_up_scale), R(dummy_), R(k.ids)}, &pe, sizeof pe, stride / 64, U, N);
+            PcExpert pe{n / l.gu_fmt->sb_cols, stride, rows, 0, 8u, U, n, n / 16, D.situ_beta, D.situ_linear_beta};
+            std::string kernel = std::string("expertpair") + (l.gu_fmt->kernel + 6);
+            p.dispatch(dev_.pipeline(kernel), {R(l.gate_up), R(k.hf.v), R(k.hf.s), W(k.act), R(l.gate_up_scale), R(dummy_), R(k.ids), W(k.acts)}, &pe, sizeof pe, stride / 64, U, N);
         }
-        PcSitu psitu{nff, D.situ_beta, D.situ_linear_beta};
-        p.dispatch(p_situ, {R(k.gu), W(k.act), W(k.acts)}, &psitu, sizeof psitu, (nff + 63) / 64, N * U);
         {
             const uint32_t stride = (n + 63) / 64 * 64;
             PcExpert pe{nff / l.dn_fmt->sb_cols, stride, n, 0, 2u, U, nff, nff / 16};

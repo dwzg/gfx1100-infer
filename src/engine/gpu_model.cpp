@@ -14,7 +14,7 @@ namespace gfx {
 
 namespace {
 struct PcMatvec { uint32_t n_in, n_rows, row0, flags; };
-struct PcMatvecQ { uint32_t n_sb, stride, n_rows, row0, flags; };
+struct PcMatvecQ { uint32_t n_sb, stride, n_rows, row0, flags; float p0 = 0, p1 = 0; };
 struct PcNorm { uint32_t n, flags; float eps; };
 struct PcAttnPrep { uint32_t hd, nh, nkv, qw, rope_dim, flags; float eps; uint32_t stride, page_shift; };
 struct PcMatmatQ { uint32_t n_sb, stride, n_rows, row0, flags, n_tokens, x_stride, xs_stride, y_stride; };
@@ -23,7 +23,7 @@ struct PcScore { uint32_t hd, stride, n_ctx; float scale; uint32_t nh, tq0, page
 struct PcSoft { uint32_t n_ctx, nh, tq0; };
 struct PcVsum { uint32_t hd, nh, nkv, n_ctx, seg, part_stride, tq0; };
 struct PcCombine { uint32_t hd, nh, seg, flags, part_stride, tq0, n_seg; };
-struct PcDnUpdate { uint32_t hk, s, n_tokens, hv_total, c_total; };
+struct PcDnUpdate { uint32_t hk, s, n_tokens, hv_total, c_total; float eps; };
 struct PcDnHist { uint32_t c_total, hw, n_tokens; };
 constexpr uint32_t k_page = 1024;       // cached positions per page (also the segment of the value sum)
 struct PcDnPrep { uint32_t n_norm, kw; float eps; uint32_t c_total; };
@@ -45,7 +45,23 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx,
         Layer &l = layers_[il];
         l.recurrent = ld.recurrent;
         l.attn_norm = load_vector(ld.attn_norm); l.ffn_norm = load_vector(ld.ffn_norm);
-        l.ffn_gate = load_matrix(ld.ffn_gate); l.ffn_up = load_matrix(ld.ffn_up); l.ffn_down = load_matrix(ld.ffn_down);
+        l.ffn_down = load_matrix(ld.ffn_down);
+        // The gate and up projections become one matrix with their rows interleaved when they
+        // can (same native format), so that the kernel can apply the activation itself.
+        const PackFormat *pf = force_fp16_ ? nullptr : pack_format(ld.ffn_gate->type);
+        if (pf && ld.ffn_gate->type == ld.ffn_up->type && ld.ffn_gate->dim(0) == ld.ffn_up->dim(0) && ld.ffn_gate->dim(1) == ld.ffn_up->dim(1) && ld.ffn_gate->dim(0) % pf->sb_cols == 0 &&
+            ld.ffn_gate->dim(1) % 16 == 0 && !getenv("GFX_NO_PAIR")) {
+            const TypeInfo *ti = type_info(ld.ffn_gate->type);
+            const uint64_t row_bytes = ld.ffn_gate->dim(0) / ti->block_elems * ti->block_bytes, rows = ld.ffn_gate->dim(1);
+            std::vector<uint8_t> both(2 * rows * row_bytes);
+            for (uint64_t r = 0; r < rows; r++) {
+                memcpy(&both[2 * r * row_bytes], ld.ffn_gate->data + r * row_bytes, row_bytes);
+                memcpy(&both[(2 * r + 1) * row_bytes], ld.ffn_up->data + r * row_bytes, row_bytes);
+            }
+            TensorInfo t = *ld.ffn_gate;
+            t.name += " + up"; t.dims = {ld.ffn_gate->dim(0), 2 * rows}; t.data = both.data(); t.nbytes = both.size(); t.nelems = 2 * ld.ffn_gate->nelems;
+            l.ffn_gu = load_matrix(&t);
+        } else { l.ffn_gate = load_matrix(ld.ffn_gate); l.ffn_up = load_matrix(ld.ffn_up); }
         if (ld.recurrent) {
             l.wqkv = load_matrix(ld.wqkv); l.wz = load_matrix(ld.wz); l.wbeta = load_matrix(ld.wbeta); l.walpha = load_matrix(ld.walpha);
             l.ssm_out = load_matrix(ld.ssm_out);
@@ -85,7 +101,8 @@ void GpuModel::init_batching(int batch, bool allow_wmma) {
     batch_ = can_batch ? std::max(1, std::min(batch, 256)) : 1;
     wmma_emu_ = getenv("GFX_WMMA_EMU") != nullptr;   // testing aid, see the kernel source
     wmma_ = allow_wmma && (dev_.caps().coop_matrix || wmma_emu_) && batch_ >= (int)k_wmma_min_tokens && !getenv("GFX_NO_WMMA");
-    const int cap_unit = wmma_ ? (int)k_wmma_tile : (int)k_tile;   // whole tiles of tokens
+    if (const char *e = getenv("GFX_TILE")) tile_ = atoi(e) == 2 ? 2 : 4;   // tuning aid: see `gfxi bench --tile`
+    const int cap_unit = wmma_ ? (int)k_wmma_tile : (int)tile_;   // whole tiles of tokens
     batch_cap_ = (batch_ + cap_unit - 1) / cap_unit * cap_unit;
     if (kv8_ && d_.head_dim % 64) throw std::runtime_error("the 8-bit cache needs a head size that is a multiple of 64");
     if (d_.head_dim % 2 || d_.n_head % d_.n_head_kv) throw std::runtime_error("unsupported attention head layout");
@@ -416,7 +433,7 @@ void GpuModel::alloc_activations() {
     const uint64_t B = batch_cap_, n = d_.n_embd, hd = d_.head_dim, nh = d_.n_head, nkv = d_.n_head_kv, qw = d_.q_has_gate ? 2 * hd : hd;
     const uint64_t S = d_.dn_head_dim, HV = d_.dn_v_heads, C = d_.dn_conv_dim(), n_seg_max = (uint64_t)n_ctx_ / page_;
     Act &a = act_;
-    a.x = scratch(B * n); a.a = scratch(B * n); a.g = scratch(B * d_.n_ff); a.u = scratch(B * d_.n_ff);
+    a.x = scratch(B * n); a.a = scratch(B * n); a.g = scratch(B * d_.n_ff); a.u = scratch(B * d_.n_ff); a.gu = scratch(B * 2 * d_.n_ff);
     a.h = scratch_vec(B * n); a.act = scratch_vec(B * d_.n_ff); a.mix = scratch_vec(B * nh * hd); a.h_last = scratch_vec(n);
     a.qfull = scratch(B * nh * qw); a.kraw = scratch(B * nkv * hd); a.vraw = scratch(B * nkv * hd);
     a.q = scratch(B * nh * hd); a.gate = scratch(B * nh * hd); a.zsum = scratch(B * nh);
@@ -439,7 +456,8 @@ void GpuModel::alloc_activations() {
 void GpuModel::matmul(Program &p, const Matrix &m, const Vec &x, const Buffer &y, uint32_t n_tokens) {
     const Buffer &bias = m.bias.valid() ? m.bias : dummy_;
     const bool batched = n_tokens > 1;
-    const uint32_t tiles = (n_tokens + k_tile - 1) / k_tile;
+    const uint32_t tiles = (n_tokens + tile_ - 1) / tile_;
+    const char *batched_kernel = tile_ == 2 ? "matmat2" : "matmat";
     uint32_t row0 = 0, flags = m.bias.valid() ? 1u : 0u;
     for (size_t c = 0; c < m.chunks.size(); c++) {
         uint32_t rows = m.chunk_rows[c];
@@ -450,7 +468,7 @@ void GpuModel::matmul(Program &p, const Matrix &m, const Vec &x, const Buffer &y
             if (use_wmma(m, n_tokens)) {
                 dispatch_wmma(p, m, c, row0, x.h, y, n_tokens);
             } else if (batched) {
-                std::string kernel = std::string("matmat") + (m.fmt->kernel + 6);   // "matvec_x" -> "matmat_x"
+                std::string kernel = std::string(batched_kernel) + (m.fmt->kernel + 6);   // "matvec_x" -> "matmat_x"
                 PcMatmatQ pc{m.n_in / m.fmt->sb_cols, stride, rows, row0, flags, n_tokens, m.n_in, m.n_in / 16, m.n_out};
                 p.dispatch(dev_.pipeline(kernel), b, &pc, sizeof pc, groups, tiles);
             } else {
@@ -459,7 +477,7 @@ void GpuModel::matmul(Program &p, const Matrix &m, const Vec &x, const Buffer &y
             }
         } else if (batched) {
             PcMatmat pc{m.n_in, rows, row0, flags, n_tokens, m.n_out};
-            p.dispatch(dev_.pipeline("matmat_f16"), {R(m.chunks[c]), R(x.v), W(y), R(bias)}, &pc, sizeof pc, (rows + 63) / 64, tiles);
+            p.dispatch(dev_.pipeline(std::string(batched_kernel) + "_f16"), {R(m.chunks[c]), R(x.v), W(y), R(bias)}, &pc, sizeof pc, (rows + 63) / 64, tiles);
         } else {
             PcMatvec pc{m.n_in, rows, row0, flags};
             p.dispatch(dev_.pipeline("matvec_f16"), {R(m.chunks[c]), R(x.v), W(y), R(bias)}, &pc, sizeof pc, (rows + 63) / 64);
@@ -495,7 +513,7 @@ void GpuModel::to_half(Program &p, const Vec &x, uint64_t n) {
 // kernel, and the format is only enabled if the two agree.
 void GpuModel::verify_wmma() {
     std::vector<const Matrix *> all;
-    for (const Layer &l : layers_) for (const Matrix *m : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wz, &l.wbeta, &l.walpha, &l.ssm_out, &l.ffn_gate, &l.ffn_up, &l.ffn_down}) all.push_back(m);
+    for (const Layer &l : layers_) for (const Matrix *m : {&l.wq, &l.wk, &l.wv, &l.wo, &l.wqkv, &l.wz, &l.wbeta, &l.walpha, &l.ssm_out, &l.ffn_gate, &l.ffn_up, &l.ffn_gu, &l.ffn_down}) all.push_back(m);
     all.push_back(&output_);
     std::vector<uint32_t> seen;
     std::string ok_names, bad_names;
@@ -582,9 +600,9 @@ Program &GpuModel::program(int n_tokens) {
             p.dispatch(p_dn_prep, {R(a.mixed), R(l.hist), R(l.conv_w), W(a.qkv)}, &pp, sizeof pp, C / S, N);
             PcDnHist ph{(uint32_t)C, (uint32_t)(d_.dn_conv - 1), N};
             p.dispatch(p_dn_hist, {R(a.mixed), W(l.hist)}, &ph, sizeof ph, (C + 63) / 64);
-            PcDnUpdate pu{(uint32_t)HK, (uint32_t)S, N, (uint32_t)HV, (uint32_t)C};
-            p.dispatch(p_dn_update, {R(a.qkv), R(a.alpha), R(a.beta), R(l.dt), R(l.a), W(l.state), W(a.dn_o)}, &pu, sizeof pu, HV);
-            norm(a.dn_o, Buffer{}, l.ssm_norm, a.z, a.dn_on, S, N * HV);
+            // State update, read-out, and the gated per-head norm of the read-out, in one step.
+            PcDnUpdate pu{(uint32_t)HK, (uint32_t)S, N, (uint32_t)HV, (uint32_t)C, d_.norm_eps};
+            p.dispatch(p_dn_update, {R(a.qkv), R(a.alpha), R(a.beta), R(l.dt), R(l.a), W(l.state), W(a.dn_on.v), R(l.ssm_norm), R(a.z), W(a.dn_on.s)}, &pu, sizeof pu, HV);
             if (halves) to_half(p, a.dn_on, n16 * HV * S);
             matmul(p, l.ssm_out, a.dn_on, a.a, N);
         } else {
@@ -609,9 +627,26 @@ Program &GpuModel::program(int n_tokens) {
         }
         norm(a.x, a.a, l.ffn_norm, Buffer{}, a.h, n, N);
         if (halves) to_half(p, a.h, n16 * n);
-        matmul(p, l.ffn_gate, a.h, a.g, N); matmul(p, l.ffn_up, a.h, a.u, N);
         uint32_t nff = N * d_.n_ff;
-        p.dispatch(p_swiglu, {R(a.g), R(a.u), W(a.act.v), W(a.act.s)}, &nff, sizeof nff, (nff / 16 + 63) / 64);
+        if (l.ffn_gu.chunks.empty()) {
+            matmul(p, l.ffn_gate, a.h, a.g, N); matmul(p, l.ffn_up, a.h, a.u, N);
+            p.dispatch(p_swiglu, {R(a.g), R(a.u), W(a.act.v), W(a.act.s)}, &nff, sizeof nff, (nff / 16 + 63) / 64);
+        } else if (N == 1) {
+            // Gate, up and the activation in one kernel.
+            const Matrix &m = l.ffn_gu;
+            uint32_t row0 = 0;
+            for (size_t c = 0; c < m.chunks.size(); c++) {
+                Buffer table = dummy_;
+                if (m.fmt->needs_table) for (auto &t : tables_) if (t.first == m.fmt->type) table = t.second;
+                PcMatvecQ pc{m.n_in / m.fmt->sb_cols, m.stride(c), m.chunk_rows[c], row0, 0};
+                p.dispatch(dev_.pipeline(std::string("pair") + (m.fmt->kernel + 6)), {R(m.chunks[c]), R(a.h.v), R(a.h.s), W(a.act.v), R(dummy_), R(table), R(dummy_), W(a.act.s)}, &pc, sizeof pc,
+                           (m.chunk_rows[c] + 63) / 64);
+                row0 += m.chunk_rows[c];
+            }
+        } else {
+            matmul(p, l.ffn_gu, a.h, a.gu, N);
+            p.dispatch(dev_.pipeline("swiglu_pair"), {R(a.gu), R(dummy_), W(a.act.v), W(a.act.s)}, &nff, sizeof nff, (nff / 16 + 63) / 64);
+        }
         if (halves) to_half(p, a.act, n16 * d_.n_ff);
         matmul(p, l.ffn_down, a.act, a.a, N);
     }

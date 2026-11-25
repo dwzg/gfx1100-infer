@@ -95,7 +95,7 @@ class GpuModel {
     size_t barriers_per_token() const;
 
   private:
-    static constexpr uint32_t k_tile = 4;                       // tokens per workgroup in the batched matrix kernels (T in the shaders)
+    uint32_t tile_ = 4;                                         // tokens per workgroup in the batched matrix kernels (T in the shaders): 4, or 2 with GFX_TILE=2
     static constexpr uint32_t k_wmma_tile = 16;                 // tokens per workgroup in the matrix-instruction kernels
     static constexpr uint32_t k_wmma_min_tokens = 12;           // below this the portable batched kernels are used
     static constexpr uint64_t k_scores_budget = 64ull << 20;    // bytes of score scratch (bounds how many queries are scored together)
@@ -114,6 +114,7 @@ class GpuModel {
         bool recurrent = false;
         Buffer attn_norm, ffn_norm, qk_norm;
         Matrix wq, wk, wv, wo, wqkv, wz, wbeta, walpha, ssm_out, ffn_gate, ffn_up, ffn_down;
+        Matrix ffn_gu;                    // gate and up with their rows interleaved (then ffn_gate and ffn_up are empty)
         Buffer kc, vc;                    // key cache (plane-major) / value cache (row-major)
         Buffer conv_w, dt, a, ssm_norm, state, hist;
         bool has_qk_norm = false;
@@ -171,7 +172,7 @@ class GpuModel {
     std::vector<std::pair<Buffer, Buffer>> caches_;   // paged key / value caches, one pair per layer that attends to everything
     std::vector<Buffer> state_bufs_;                  // everything else that depends on the tokens processed (cleared by reset)
     // Activations for up to batch_cap_ tokens (one vector per token, consecutive).
-    struct Act { Buffer x, a, g, u, qfull, kraw, vraw, q, gate, scores, zsum, part, mixed, z, alpha, beta, qkv, dn_o, logits; Vec h, act, mix, dn_on, h_last; } act_;
+    struct Act { Buffer x, a, g, u, gu, qfull, kraw, vraw, q, gate, scores, zsum, part, mixed, z, alpha, beta, qkv, dn_o, logits; Vec h, act, mix, dn_on, h_last; } act_;
     int batch_ = 1, batch_cap_ = 8, q_batch_ = 1;   // tokens per batch; allocated capacity; queries scored together
     uint32_t part_stride_ = 0;
     bool wmma_ = false;                    // device has the matrix instructions and they are allowed

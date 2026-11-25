@@ -5,6 +5,8 @@
 // read adjacent memory. For each token:
 //   T[i][j] <- decay * T[i][j] + delta_j * k[i],   delta_j = (v[j] - sum_i decay*T[i][j]*k[i]) * beta
 //   out[j]   = sum_i T[i][j] * q[i] / sqrt(S)
+// The read-out is then RMS-normalised over the head, scaled by w and gated by silu(z), and its
+// sums over blocks of 16 are written for the matrix product that follows.
 #include "common.glsl"
 layout(local_size_x_id = 0) in;   // = head_dim
 layout(binding = 0) readonly buffer BQKV { float qkv[]; };   // [token]: q heads, k heads, v heads
@@ -13,9 +15,13 @@ layout(binding = 2) readonly buffer BBE { float beta[]; };
 layout(binding = 3) readonly buffer BDT { float dt[]; };
 layout(binding = 4) readonly buffer BA { float a[]; };
 layout(binding = 5) buffer BS { float st[]; };
-layout(binding = 6) writeonly buffer BO { float o[]; };      // [token][head][j]
+layout(binding = 6) writeonly buffer BO { float o[]; };      // [token][head][j], normalised and gated
+layout(binding = 7) readonly buffer BW { float w[]; };       // norm weight, [j]
+layout(binding = 8) readonly buffer BZ { float z[]; };       // gate, [token][head][j]
+layout(binding = 9) writeonly buffer BOS { float os[]; };    // block sums of o
+shared float red[gl_WorkGroupSize.x];
 // s = head_dim again, as a run-time value so the driver keeps the loops below as loops
-layout(push_constant) uniform PC { uint hk; uint s; uint n_tokens; uint hv_total; uint c_total; } pc;
+layout(push_constant) uniform PC { uint hk; uint s; uint n_tokens; uint hv_total; uint c_total; float eps; } pc;
 
 void main() {
     uint hv = gl_WorkGroupID.x, j = gl_LocalInvocationID.x, S = pc.s;
@@ -34,6 +40,18 @@ void main() {
             uint idx = sb + i * S + j;
             st[idx] = st[idx] * decay + delta * qkv[kb + i];
         }
-        o[(tk * pc.hv_total + hv) * S + j] = (aq + delta * kq) * inversesqrt(float(S));
+        float v = (aq + delta * kq) * inversesqrt(float(S));
+        red[j] = v * v;
+        barrier();
+        if (j == 0u) { float t = 0.0; for (uint i = 0u; i < S; i++) t += red[i]; red[0] = t; }
+        barrier();
+        uint ob = (tk * pc.hv_total + hv) * S + j;
+        v *= inversesqrt(red[0] / float(S) + pc.eps) * w[j] * silu(z[ob]);
+        barrier();
+        o[ob] = v;
+        red[j] = v;
+        barrier();
+        if ((j & 15u) == 0u) { float t = 0.0; for (uint i = 0u; i < 16u; i++) t += red[j + i]; os[ob >> 4] = t; }
+        barrier();
     }
 }

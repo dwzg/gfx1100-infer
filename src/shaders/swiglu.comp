@@ -1,6 +1,8 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 // act = silu(g) * u, plus the sums of act over blocks of 16 elements. One lane per block.
+// PAIRED: g and u alternate in one buffer (g0, u0, g1, u1, ...), as a matrix that holds the gate
+// and up projections with their rows interleaved produces them.
 #include "common.glsl"
 layout(local_size_x = 64) in;
 layout(binding = 0) readonly buffer BG { float g[]; };
@@ -12,6 +14,10 @@ void main() {
     uint b = 16u * gl_GlobalInvocationID.x;
     if (b >= pc.n) return;
     float bsum = 0.0;
+#ifdef PAIRED
+    for (uint i = b; i < min(b + 16u, pc.n); i++) { float v = silu(g[2u * i]) * g[2u * i + 1u]; y[i] = v; bsum += v; }
+#else
     for (uint i = b; i < min(b + 16u, pc.n); i++) { float v = silu(g[i]) * u[i]; y[i] = v; bsum += v; }
+#endif
     ys[b >> 4] = bsum;
 }

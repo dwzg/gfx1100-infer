@@ -199,6 +199,11 @@ weight exactly once per token, as cheaply as possible:
 - *One submission per token (or per prompt batch).* The forward pass is recorded once per batch
   size as a command buffer and resubmitted; position-dependent values come from small host
   buffers. Sync points are placed only where one dispatch reads what an earlier one wrote.
+- *Steps that would wait for each other are fused.* The feed-forward's gate and up projections
+  are stored as one matrix with their rows interleaved, so the kernel that multiplies by it
+  applies the activation to each pair itself; the linear-attention update normalises and gates
+  its own read-out. For the 24-layer Qwen 3.5 test model that leaves 297 dispatches and 215
+  sync points per token (363 and 257 before).
 - *Prompts in batches.* Every kernel takes a token dimension. The matrix kernels are written
   against a few accumulator operations that are scalar for generation, 4 tokens wide for prompts
   (each weight decoded once per tile), or emit decoded weights into shared memory for the
@@ -231,8 +236,9 @@ weight exactly once per token, as cheaply as possible:
 - *The loop is unrolled when the forward pass is recorded*: 48 slot executions. Consecutive
   steps are fused into single kernels where one would otherwise wait for the other (mixing with
   the norm that follows it, the message controllers, routing with its matrix product, the bias
-  table with the cache write, the experts' sum with the convolution and the residual), which
-  leaves 1,292 dispatches and 896 synchronisation points per token (down from 1,963 and 1,449).
+  table with the cache write, each expert's gate and up halves with their activation, the
+  experts' sum with the convolution and the residual). That leaves 1,244 dispatches and 848
+  synchronisation points per token (1,963 and 1,449 before fusing).
 
 **Correctness first.** `src/core/ref.cpp` is a plain scalar implementation of the forward pass.
 The GPU engine is checked against it logit by logit, and it is itself checked by generating
@@ -253,14 +259,14 @@ What was checked, and how:
 | Batched prompts (batch sizes 1, 5, 7, 32; forced query sub-batches), all 12 model files | CPU reference | Same results as token-by-token |
 | Batched and emulated matrix-path kernels, all 14 native formats, on real weight samples | Scalar decoder | Relative error about 3e-7 (batched) and 3e-4 (half-precision matrix path) |
 | 8-bit cache | CPU reference | Relative logit error 0.4-0.9% on Qwen 3.5 0.8B; 1-2% on a 135M Llama-style model |
-| Every kernel compiles for the 7900 XTX, including the matrix-instruction and Inkling ones | RADV 25.2.8 as Navi 31 (no hardware) | All 107 compile, none spills vector registers; the batched kernels of seven formats spill 27-38 scalar registers (to tune on the card); the matrix kernels contain `v_wmma_f32_16x16x16_f16` |
+| Every kernel compiles for the 7900 XTX, including the matrix-instruction and Inkling ones | RADV 25.2.8 as Navi 31 (no hardware) | All 148 compile, none spills vector registers; the 4-token batched kernels of seven formats spill 27-38 scalar registers, their 2-token variants (`GFX_TILE=2`) none; the matrix kernels contain `v_wmma_f32_16x16x16_f16` |
 | Paged cache with small pages handed out in reverse order, half-precision and 8-bit | CPU reference | Same errors as unpaged |
 | Conversation cache: continuing, branching, returning, same prompt again, eviction (Qwen 3.5 with both cache types, Qwen 3) | Processing the same prompt from scratch | Bit-identical logits |
 | Prompt formatting: 86 prompts with system text, tools, calls, results, reasoning and effort levels, on the templates of Qwen 3.8, 3.5, 3, 2.5 and SmolLM2 | The model's own template, run with jinja2 | Byte-identical |
 | Reply parser: 14 replies, each fed in pieces of 1, 2, 3, 7, 64 bytes and whole | Expected blocks; events add up to the blocks; parsed and written back gives the original text | All pass |
 | Server protocol: streaming, forced tool call, tool result, reuse across turns and across a side request, cancel, stop sequence, errors | Official `anthropic` Python SDK 2.14 as the client | All pass; a follow-up turn reused 432 of 432 earlier tokens |
 | Inkling 2 Mini, CPU reference | The text it writes | Coherent reasoning and a correct answer ("Capital of France is Paris ... `s[::-1]`") |
-| Inkling 2 Mini, GPU engine: token by token, prompts in batches of 8, 8-bit cache, and a start at position 9,000 (ring wrap-around, distances past the bias table, position scaling) | Its CPU reference | Relative logit error 7e-5 (half precision), 4e-4 at position 9,000, about 2e-2 (8-bit); same top token throughout |
+| Inkling 2 Mini, GPU engine: token by token, prompts in batches of 8, 8-bit cache, and a start at position 9,000 (ring wrap-around, distances past the bias table, position scaling) | Its CPU reference | Relative logit error 7e-5 (half precision), 4e-4 at position 9,000, about 2e-2 (8-bit; 6e-2 at position 9,000 over the all-zero cache of that test); same top token throughout |
 | Conversation cache with the Inkling engine: continuing, a side request branching off, returning, a second conversation with the same beginning | Processing the same tokens from scratch | Bit-identical logits |
 | Inkling prompt formatting (32 prompts) and reply parsing (6 cases at every piece size) | Its own template run with jinja2; expected blocks | Byte-identical; all pass |
 | Prompt store: a request, a server restart, the same request and a different one | The first run | The restart begins from the stored prefix (415 of 430 tokens), gives the same answer, and the next question reuses it too |
@@ -301,9 +307,10 @@ In order:
 1. `gfxi devices`, then `tests/run_tests.sh` on the real card. The `test-matvec` lines labelled
    "matrix instructions" and the start-up line "matrix instructions verified for: ..." say whether
    the WMMA kernels are correct there.
-2. `gfxi bench` and `gfxi bench model.gguf` (also with `--no-wmma`). This gives the achievable
-   memory bandwidth, each kernel as a fraction of it, the cost of a dispatch plus sync point, and
-   prompt and generation speed.
+2. `gfxi bench` and `gfxi bench model.gguf` (also with `--no-wmma`, and with `--tile 2`: the
+   batched kernels with 2 instead of 4 tokens per workgroup, which keep everything in registers).
+   This gives the achievable memory bandwidth, each kernel as a fraction of it, the cost of a
+   dispatch plus sync point, and prompt and generation speed.
 3. Tune from those numbers: wave size, loads in flight per wave, splitting columns across more
    waves, tokens per tile, a faster codebook lookup for IQ4 and NVFP4 (those kernels currently do
    about 3x the arithmetic of Q4_K per weight), and folding the half-precision conversion into the
@@ -313,7 +320,7 @@ In order:
    and how well the model handles Claude Code's tool calls.
 5. Inkling 2 Mini: `gfxi compare Inkling-2-Mini-UD-Q4_K_M.gguf` (GPU against the CPU reference,
    this time with every expert on the device), then `gfxi bench` and `gfxi serve` with it. Its
-   forward pass is about 1,300 small dispatches with 900 synchronisation points per token, so
+   forward pass is about 1,250 small dispatches with 850 synchronisation points per token, so
    expect those, rather than memory bandwidth, to set its speed; `gfxi bench` shows what one costs.
 
 ## Layout

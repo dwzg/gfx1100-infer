@@ -3,7 +3,11 @@
 // Batched form of matvec_f16: T tokens per workgroup (gl_WorkGroupID.y selects the tile).
 #include "common.glsl"
 layout(local_size_x = 64) in;
+#ifdef TILE2
+#define T 2u
+#else
 #define T 4u
+#endif
 layout(binding = 0) readonly buffer BW { float16_t w[]; };
 layout(binding = 1) readonly buffer BX { float x[]; };
 layout(binding = 2) writeonly buffer BY { float y[]; };

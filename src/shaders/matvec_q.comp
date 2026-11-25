@@ -49,7 +49,12 @@ uint g_lrow, g_col0;               // this lane's row offset in wbuf; first colu
 struct Cols { uint lo; uint hi; }; // a run of columns of the current chunk
 #define ACC Cols
 #elif defined(BATCH)
+// Tokens per workgroup. More tokens share each decoded weight, fewer keep less in registers.
+#ifdef TILE2
+#define T 2u
+#else
 #define T 4u
+#endif
 layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; uint n_tokens; uint x_stride; uint xs_stride; uint y_stride; } pc;
 uint g_x0, g_s0;                   // offsets of the tile's first token in x and xs
 #define ACC float[T]
@@ -61,7 +66,7 @@ uint g_x0, g_s0;                   // offsets of the tile's first token in x and
 // One of many matrices in the buffer (the experts of a mixture-of-experts layer), chosen per
 // (token, slot) pair by ids; the result is scaled by the expert's entry in `bias`.
 layout(binding = 6) readonly buffer BI { uint ids[]; };
-layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; uint used; uint x_stride; uint xs_stride; } pc;
+layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; uint used; uint x_stride; uint xs_stride; float p0; float p1; } pc;
 uint g_x0, g_s0;
 #define ACC float
 #define FOR_T
@@ -69,12 +74,36 @@ uint g_x0, g_s0;
 #define X(i) x[g_x0 + (i)]
 #define XS(i) xs[g_s0 + (i)]
 #else
-layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; } pc;
+layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; float p0; float p1; } pc;
 #define ACC float
 #define FOR_T
 #define A(a) a
 #define X(i) x[i]
 #define XS(i) xs[i]
+#endif
+#ifdef PAIR
+// The matrix holds a gate and an up projection with their rows interleaved (gate 0, up 0, gate 1,
+// ...). Instead of the rows, the kernel writes the gated activation of each pair and its sums
+// over blocks of 16, so no separate activation step has to wait for this one.
+//   flags bit 8:  act = p0 * tanh(gate / p0) * sigmoid(gate) * p1 * tanh(up / p1)   (SITU; p1 <= 0: times up)
+//   otherwise:    act = silu(gate) * up
+layout(binding = 7) writeonly buffer BYS { float ysum[]; };
+shared float pv[64];
+void write_pairs(float v, uint out0, uint row) {
+    uint lid = gl_LocalInvocationID.x;
+    pv[lid] = row < pc.n_rows ? v : 0.0;
+    barrier();
+    float a = 0.0;
+    if ((lid & 1u) == 0u) {
+        float g = pv[lid], u = pv[lid + 1u];
+        a = (pc.flags & 8u) != 0u ? pc.p0 * tanh(g / pc.p0) * sigmoid(g) * (pc.p1 > 0.0 ? pc.p1 * tanh(u / pc.p1) : u) : silu(g) * u;
+        if (row < pc.n_rows) y[out0 + (row >> 1)] = a;
+    }
+    barrier();
+    pv[lid] = a;
+    barrier();
+    if ((lid & 31u) == 0u && row < pc.n_rows) { float t = 0.0; for (uint k = 0u; k < 32u; k += 2u) t += pv[lid + k]; ysum[(out0 + (row >> 1)) >> 4] = t; }
+}
 #endif
 
 #define M4 0x0F0F0F0Fu
@@ -488,13 +517,21 @@ void main() {
         g_base = ebase + s * NW * pc.stride + row;
         superblock(s * SB);
     }
+#ifdef PAIR
+    write_pairs(g_tot * bias[id], pr * (pc.n_rows >> 1), row);
+#else
     if (row < pc.n_rows) y[pr * pc.n_rows + row] = g_tot * bias[id];
+#endif
     return;
 #else
     for (uint s = 0u; s < pc.n_sb; s++) {
         g_base = s * NW * pc.stride + row;
         superblock(s * SB);
     }
+#ifdef PAIR
+    write_pairs(g_tot, pc.row0 >> 1, row);
+    return;
+#endif
     if (row >= pc.n_rows) return;
     float bv = (pc.flags & 1u) != 0u ? bias[pc.row0 + row] : 0.0;
 #ifdef BATCH

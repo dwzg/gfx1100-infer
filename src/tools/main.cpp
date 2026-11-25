@@ -857,6 +857,7 @@ static int cmd_bench(int argc, char **argv) {
         else if (a == "--kv8") kv8 = true;
         else if (a == "--batch") batch = atoi(next());
         else if (a == "--no-wmma") no_wmma = true;
+        else if (a == "--tile") setenv("GFX_TILE", next(), 1);   // tokens per workgroup in the batched kernels: 2 or 4
         else model = a;
     }
     Device dev(device);
@@ -1073,7 +1074,7 @@ int main(int argc, char **argv) {
                         "  serve <model.gguf>              Messages API server, for Claude Code and other clients of that API\n"
                         "  devices                         list Vulkan devices and the features this engine uses\n"
                         "  compare <model.gguf>            check the GPU engine against the CPU reference\n"
-                        "  bench [model.gguf] [--wave 32|64]  memory roofline and kernel throughput; with a model, prompt and generation tok/s\n"
+                        "  bench [model.gguf] [--wave 32|64] [--tile 2|4] [--no-wmma]  memory roofline and kernel throughput; with a model, prompt and generation tok/s\n"
                         "  kernels [name] [--code]         compile every kernel on the device; --code prints the machine code\n"
                         "  tokenize <model.gguf> <text|@file>  print token ids\n");
         return 2;
