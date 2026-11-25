@@ -2,14 +2,20 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "core/gguf.h"
+#include "core/model.h"
 #include "core/quant.h"
+#include "core/ref.h"
+#include "core/sampler.h"
+#include "core/unicode.h"
 #include "core/tokenizer.h"
 
 using namespace gfx;
@@ -103,13 +109,72 @@ static int cmd_tokenize(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_run(int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "usage: gfxi run <model.gguf> -p <prompt | @file> [-n tokens] [--chat] [--temp T] [--top-k K] [--top-p P]\n"
+                        "                [--seed S] [--ctx N] [--threads N] [--logits out.f32]\n");
+        return 2;
+    }
+    std::string prompt, logits_path; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false;
+    SamplerParams sp; sp.temperature = 0;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
+        if (a == "-p") prompt = read_arg_text(next());
+        else if (a == "-n") n_predict = atoi(next());
+        else if (a == "--chat") chat = true;
+        else if (a == "--temp") sp.temperature = (float)atof(next());
+        else if (a == "--top-k") sp.top_k = atoi(next());
+        else if (a == "--top-p") sp.top_p = (float)atof(next());
+        else if (a == "--seed") sp.seed = strtoull(next(), nullptr, 10);
+        else if (a == "--ctx") n_ctx = atoi(next());
+        else if (a == "--threads") threads = atoi(next());
+        else if (a == "--logits") logits_path = next();
+        else throw std::runtime_error("unknown option " + a);
+    }
+    GGUF g; g.open(argv[0]);
+    ModelDesc desc = describe_model(g);
+    Tokenizer tok(g);
+    if (chat) prompt = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    std::vector<int32_t> ids = tok.encode(prompt, true, true);
+    if (ids.empty()) throw std::runtime_error("the prompt is empty");
+    if (n_ctx <= 0) n_ctx = (int)ids.size() + n_predict + 1;
+    fprintf(stderr, "[reference CPU path] %s: %d layers (%d full attention), %d prompt tokens\n", desc.name.c_str(), desc.n_layer, desc.n_attn_layers(), (int)ids.size());
+    RefModel model(g, desc, n_ctx, threads);
+    Sampler sampler(sp);
+    auto t0 = std::chrono::steady_clock::now();
+    const std::vector<float> *logits = &model.eval(ids.data(), (int)ids.size());
+    auto t1 = std::chrono::steady_clock::now();
+    if (!logits_path.empty()) {
+        FILE *f = fopen(logits_path.c_str(), "wb");
+        if (!f || fwrite(logits->data(), 4, logits->size(), f) != logits->size()) throw std::runtime_error("cannot write " + logits_path);
+        fclose(f);
+    }
+    std::string pending; int n_gen = 0;
+    for (; n_gen < n_predict; n_gen++) {
+        int32_t t = sampler.sample(logits->data(), (int)logits->size());
+        if (tok.is_eog(t)) break;
+        pending += tok.piece(t);
+        size_t ok = utf8_complete_prefix(pending);
+        fwrite(pending.data(), 1, ok, stdout); fflush(stdout); pending.erase(0, ok);
+        if (n_gen + 1 < n_predict) logits = &model.eval(&t, 1);
+    }
+    fwrite(pending.data(), 1, pending.size(), stdout); printf("\n");
+    auto t2 = std::chrono::steady_clock::now();
+    double pre = std::chrono::duration<double>(t1 - t0).count(), gen = std::chrono::duration<double>(t2 - t1).count();
+    fprintf(stderr, "[prompt %d tokens in %.2f s, generated %d tokens in %.2f s (%.2f tok/s)]\n", (int)ids.size(), pre, n_gen, gen, n_gen > 1 ? (n_gen - 1) / gen : 0.0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     try {
         if (argc >= 2 && !strcmp(argv[1], "info")) return cmd_info(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "dequant")) return cmd_dequant(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "run")) return cmd_run(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "tokenize")) return cmd_tokenize(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "dequant-raw")) return cmd_dequant_raw(argc - 2, argv + 2);
         fprintf(stderr, "usage: gfxi <command> ...\n  info <model.gguf> [--tensors]   show model metadata and weight encodings\n"
+                        "  run <model.gguf> -p <prompt>    generate text\n"
                         "  tokenize <model.gguf> <text|@file>  print token ids\n");
         return 2;
     } catch (const std::exception &e) {
