@@ -162,10 +162,12 @@ Device::Device(const std::string &select_in) {
     VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     check(vkCreatePipelineCache(dev_, &pci, nullptr, &cache_), "vkCreatePipelineCache");
 
-    staging_ = alloc_host(k_staging_bytes);
 }
 
 Device::~Device() {
+    // RADV's hardware-less "null" device (RADV_FORCE_FAMILY, used to inspect generated code) cannot
+    // execute or tear anything down; leave it to process exit.
+    if (caps_.name.rfind("Null hardware", 0) == 0) return;
     if (dev_) {
         vkDeviceWaitIdle(dev_);
         for (auto &[k, p] : pipelines_) vkDestroyPipeline(dev_, p->handle, nullptr);
@@ -235,6 +237,7 @@ Buffer Device::alloc_host(uint64_t size) { return alloc_from(host_arenas_, size,
 void Device::upload(const Buffer &dst, const void *data, uint64_t size) {
     if (size > dst.size) throw std::runtime_error("internal: upload larger than buffer");
     if (dst.mapped) { memcpy(dst.mapped, data, size); return; }
+    if (!staging_.valid()) staging_ = alloc_host(k_staging_bytes);
     for (uint64_t done = 0; done < size;) {
         uint64_t n = std::min(size - done, staging_.size);
         memcpy(staging_.mapped, (const char *)data + done, n);
@@ -245,6 +248,7 @@ void Device::upload(const Buffer &dst, const void *data, uint64_t size) {
 void Device::download(const Buffer &src, void *data, uint64_t size) {
     if (size > src.size) throw std::runtime_error("internal: download larger than buffer");
     if (src.mapped) { memcpy(data, src.mapped, size); return; }
+    if (!staging_.valid()) staging_ = alloc_host(k_staging_bytes);
     for (uint64_t done = 0; done < size;) {
         uint64_t n = std::min(size - done, staging_.size);
         Program p(*this); p.copy(src.sub(done, n), staging_.sub(0, n)); p.finish(); p.run();

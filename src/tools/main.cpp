@@ -240,6 +240,35 @@ static int cmd_devices() {
     return 0;
 }
 
+// Build every kernel on the selected device and report what the driver compiled it to.
+static int cmd_kernels(int argc, char **argv) {
+    std::string only, device; bool code = false; uint32_t subgroup = 0; std::vector<uint32_t> spec;
+    for (int i = 0; i < argc; i++) {
+        std::string a = argv[i];
+        auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
+        if (a == "--code") code = true;
+        else if (a == "--wave") subgroup = (uint32_t)atoi(next());
+        else if (a == "--device") device = next();
+        else if (a == "--spec") { for (char *t = strtok((char *)next(), ","); t; t = strtok(nullptr, ",")) spec.push_back((uint32_t)atoi(t)); }
+        else only = a;
+    }
+    Device dev(device);
+    printf("device %s (driver %s)\n", dev.caps().name.c_str(), dev.caps().driver.c_str());
+    int failed = 0;
+    for (const ShaderBlob &b : all_shaders()) {
+        if (!only.empty() && only != b.name) continue;
+        // Kernels whose workgroup size is a specialization constant need one to compile.
+        std::vector<uint32_t> sp = spec;
+        if (sp.empty() && (!strcmp(b.name, "attn_prep") || !strncmp(b.name, "dn_", 3))) sp = {128};
+        try {
+            std::string info = dev.describe_pipeline(b.name, sp, subgroup, code);
+            dev.pipeline(b.name, sp, subgroup);
+            printf("== %s: ok\n%s", b.name, info.c_str());
+        } catch (const std::exception &e) { printf("== %s: FAILED: %s\n", b.name, e.what()); failed++; }
+    }
+    return failed ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     try {
         if (argc >= 2 && !strcmp(argv[1], "info")) return cmd_info(argc - 2, argv + 2);
@@ -247,12 +276,14 @@ int main(int argc, char **argv) {
         if (argc >= 2 && !strcmp(argv[1], "run")) return cmd_run(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "compare")) return cmd_compare(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "devices")) return cmd_devices();
+        if (argc >= 2 && !strcmp(argv[1], "kernels")) return cmd_kernels(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "tokenize")) return cmd_tokenize(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "dequant-raw")) return cmd_dequant_raw(argc - 2, argv + 2);
         fprintf(stderr, "usage: gfxi <command> ...\n  info <model.gguf> [--tensors]   show model metadata and weight encodings\n"
                         "  run <model.gguf> -p <prompt>    generate text\n"
                         "  devices                         list Vulkan devices and the features this engine uses\n"
                         "  compare <model.gguf>            check the GPU engine against the CPU reference\n"
+                        "  kernels [name] [--code]         compile every kernel on the device; --code prints the machine code\n"
                         "  tokenize <model.gguf> <text|@file>  print token ids\n");
         return 2;
     } catch (const std::exception &e) {
