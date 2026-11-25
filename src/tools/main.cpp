@@ -301,6 +301,92 @@ static int cmd_devices() {
     return 0;
 }
 
+static double seconds_since(std::chrono::steady_clock::time_point t0) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+
+// Device benchmark: achievable memory bandwidth, the throughput of each quantised matvec kernel
+// relative to it, and the fixed cost of a dispatch. With a model: tokens per second.
+static int cmd_bench(int argc, char **argv) {
+    std::string device, model; uint64_t mib = 512; uint32_t wave = 0; int n_tokens = 32; bool kv8 = false;
+    for (int i = 0; i < argc; i++) {
+        std::string a = argv[i];
+        auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
+        if (a == "--device") device = next();
+        else if (a == "--mib") mib = strtoull(next(), nullptr, 10);
+        else if (a == "--wave") wave = (uint32_t)atoi(next());
+        else if (a == "-n") n_tokens = atoi(next());
+        else if (a == "--kv8") kv8 = true;
+        else model = a;
+    }
+    Device dev(device);
+    const DeviceCaps &c = dev.caps();
+    printf("device %s (driver %s), kernels built for wave size %s\n", c.name.c_str(), c.driver.c_str(), wave ? std::to_string(wave).c_str() : "default");
+    if (!model.empty()) {
+        GGUF g; g.open(model);
+        ModelDesc desc = describe_model(g);
+        int n_ctx = n_tokens + 8;
+        auto t0 = std::chrono::steady_clock::now();
+        GpuModel gpu(dev, g, desc, n_ctx, false, kv8);
+        printf("%s: loaded in %.1f s, weights %.2f GiB, %zu dispatches and %zu sync points per token\n", desc.name.c_str(), seconds_since(t0),
+               gpu.weight_bytes() / 1073741824.0, gpu.dispatches_per_token(), gpu.barriers_per_token());
+        std::vector<int32_t> toks(n_tokens);
+        for (int i = 0; i < n_tokens; i++) toks[i] = (int32_t)((1000003ull * (i + 1)) % (uint64_t)desc.n_vocab);
+        gpu.eval(toks.data(), 2);   // warm-up
+        t0 = std::chrono::steady_clock::now();
+        gpu.eval(toks.data() + 2, n_tokens - 2);
+        double dt = seconds_since(t0) / (n_tokens - 2);
+        printf("generation speed: %.2f ms per token = %.1f tok/s  (reads %.2f GiB per token -> %.0f GB/s effective)\n", dt * 1e3, 1.0 / dt,
+               gpu.weight_bytes() / 1073741824.0, gpu.weight_bytes() / dt / 1e9);
+        return 0;
+    }
+    const uint64_t limit = std::min<uint64_t>(c.max_storage_range, mib << 20);
+    const uint32_t stride = 16384;
+    Buffer y = dev.alloc(stride * 4ull), dummy = dev.alloc(256); dev.fill_zero(dummy);
+    // 1. dispatch + sync overhead
+    {
+        Buffer xs = dev.alloc(256), x = dev.alloc(4096); dev.fill_zero(x);
+        Program p(dev); uint32_t nb = 16; const int reps = 2000;
+        for (int i = 0; i < reps; i++) p.dispatch(dev.pipeline("blocksum"), {R(x), W(xs)}, &nb, sizeof nb, 1);   // each rewrites xs -> one sync point each
+        p.finish(); p.run();
+        auto t0 = std::chrono::steady_clock::now(); p.run();
+        printf("dispatch + sync point: %.2f us each\n", seconds_since(t0) / reps * 1e6);
+    }
+    // 2. bandwidth roofline
+    uint32_t planes = (uint32_t)(limit / (stride * 4ull));
+    uint64_t bytes = (uint64_t)planes * stride * 4;
+    Buffer big = dev.alloc(bytes);
+    {
+        std::vector<uint32_t> rnd(1 << 22); uint32_t s = 99;
+        for (auto &v : rnd) { s = s * 1664525u + 1013904223u; v = s; }
+        for (uint64_t off = 0; off < bytes; off += rnd.size() * 4) dev.upload(big.sub(off, std::min<uint64_t>(rnd.size() * 4, bytes - off)), rnd.data(), std::min<uint64_t>(rnd.size() * 4, bytes - off));
+    }
+    double roof = 0;
+    {
+        struct { uint32_t n_planes, stride; } pc{planes, stride};
+        Program p(dev); const int reps = 8;
+        for (int i = 0; i < reps; i++) p.dispatch(dev.pipeline("memread", {}, wave), {R(big), W(y)}, &pc, sizeof pc, stride / 64);
+        p.finish(); p.run();
+        auto t0 = std::chrono::steady_clock::now(); p.run();
+        roof = bytes * (double)reps / seconds_since(t0) / 1e9;
+        printf("memory read roofline: %.0f GB/s  (%llu MiB, %u rows)\n", roof, (unsigned long long)(bytes >> 20), stride);
+    }
+    // 3. each matvec kernel on the same data, as a matrix with `stride` rows
+    Buffer x = dev.alloc(4ull << 20), xs = dev.alloc(1 << 20); dev.fill_zero(x); dev.fill_zero(xs);
+    for (uint32_t type : {(uint32_t)T_Q4_K, (uint32_t)T_Q5_K, (uint32_t)T_Q6_K, (uint32_t)T_Q3_K, (uint32_t)T_IQ4_XS, (uint32_t)T_IQ4_NL, (uint32_t)T_Q8_0, (uint32_t)T_NVFP4}) {
+        const PackFormat *pf = pack_format(type);
+        uint32_t n_sb = std::min<uint32_t>(planes / pf->sb_words, (4u << 20) / 4 / pf->sb_cols);
+        struct { uint32_t n_sb, stride, n_rows, row0, flags; } pc{n_sb, stride, stride, 0, 0};
+        uint64_t used = (uint64_t)n_sb * pf->sb_words * stride * 4;
+        Program p(dev); const int reps = 4;
+        for (int i = 0; i < reps; i++) p.dispatch(dev.pipeline(pf->kernel, {}, wave), {R(big), R(x), R(xs), W(y), R(dummy)}, &pc, sizeof pc, stride / 64);
+        p.finish(); p.run();
+        auto t0 = std::chrono::steady_clock::now(); p.run();
+        double gbs = used * (double)reps / seconds_since(t0) / 1e9;
+        printf("  %-7s %6.0f GB/s  (%3.0f%% of roofline, %.1f billion weights/s)\n", type_info(type)->name, gbs, 100.0 * gbs / roof,
+               gbs * 8.0 / type_info(type)->bpw());
+    }
+    return 0;
+}
+
 // Check one quantised matvec kernel against the scalar decoder, on raw block data of the given
 // type laid out as a matrix with n_in columns and a random input vector.
 static int cmd_test_matvec(int argc, char **argv) {
@@ -382,6 +468,7 @@ int main(int argc, char **argv) {
         if (argc >= 2 && !strcmp(argv[1], "compare")) return cmd_compare(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "devices")) return cmd_devices();
         if (argc >= 2 && !strcmp(argv[1], "kernels")) return cmd_kernels(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "bench")) return cmd_bench(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "test-matvec")) return cmd_test_matvec(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "tokenize")) return cmd_tokenize(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "dequant-raw")) return cmd_dequant_raw(argc - 2, argv + 2);
@@ -390,6 +477,7 @@ int main(int argc, char **argv) {
                         "  run <model.gguf> -p <prompt>    generate text\n"
                         "  devices                         list Vulkan devices and the features this engine uses\n"
                         "  compare <model.gguf>            check the GPU engine against the CPU reference\n"
+                        "  bench [model.gguf] [--wave 32|64]  memory roofline and kernel throughput; with a model, tokens per second\n"
                         "  kernels [name] [--code]         compile every kernel on the device; --code prints the machine code\n"
                         "  tokenize <model.gguf> <text|@file>  print token ids\n");
         return 2;

@@ -1,0 +1,20 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Memory-bandwidth roofline: read a buffer with the same access pattern as the quantised matvec
+// kernels (one lane per row, plane after plane) while doing almost no arithmetic.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer BW { uint w[]; };
+layout(binding = 1) writeonly buffer BY { uint y[]; };
+layout(push_constant) uniform PC { uint n_planes; uint stride; } pc;
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.stride) return;
+    uint a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u, k = 0u;
+    for (; k + 4u <= pc.n_planes; k += 4u) {
+        a0 ^= w[k * pc.stride + row]; a1 ^= w[(k + 1u) * pc.stride + row];
+        a2 ^= w[(k + 2u) * pc.stride + row]; a3 ^= w[(k + 3u) * pc.stride + row];
+    }
+    for (; k < pc.n_planes; k++) a0 ^= w[k * pc.stride + row];
+    y[row] = a0 ^ a1 ^ a2 ^ a3;
+}
