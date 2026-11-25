@@ -33,6 +33,11 @@ class ContextCache {
         int max_checkpoints = 3;     // per conversation, not counting the marked positions
         int min_gap = 256;           // tokens processed since the last checkpoint that justify another
         int leave_gap = 16;          // the same, when the GPU is about to be handed to another conversation
+        // Keep the processed context at marked positions in files in this directory, and start from
+        // such a file when a prompt begins the same way (after a restart, or in a new conversation).
+        std::string store_dir;
+        int store_min_tokens = 512;  // only what took at least this many tokens to process is stored
+        int store_max_files = 8;     // the oldest files go first
     };
     explicit ContextCache(GpuModel &m);
     ContextCache(GpuModel &m, Options o);
@@ -44,6 +49,7 @@ class ContextCache {
         int reused = 0;       // leading tokens that were not processed again
         int evaluated = 0;
         bool cancelled = false;
+        int from_disk = 0;    // of the reused tokens, how many came from a stored file
     };
     // Process `prompt` (at least one token), leaving its last token's logits in logits().
     // `marks` are positions (token counts) worth a checkpoint, e.g. the end of a system prompt
@@ -70,6 +76,8 @@ class ContextCache {
     bool evict_one(const Conv *keep);
     void make_room(int upto);
     Conv *add_conv(int seq);
+    std::string store_path(const std::vector<int32_t> &prompt, int n) const;
+    void store_prune() const;
 
     GpuModel &m_;
     Options o_;

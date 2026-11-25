@@ -715,6 +715,19 @@ void GpuModel::save_state(const std::string &path, const std::vector<int32_t> &t
     }
 }
 
+std::vector<int32_t> GpuModel::saved_tokens(const std::string &path) const {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return {};
+    StateHeader h;
+    std::vector<int32_t> tokens;
+    const bool ok = fread(&h, 1, sizeof h, f) == sizeof h && !memcmp(h.magic, k_state_magic, 8) && h.version == 2 && h.model_bytes == g_.file_size && h.n_layer == (uint32_t)d_.n_layer &&
+                    h.head_dim == (uint32_t)d_.head_dim && h.n_embd == (uint32_t)d_.n_embd && h.n_vocab == (uint32_t)d_.n_vocab && h.kv8 == (uint32_t)kv8_ && h.kv_words == kv_words_ &&
+                    (int)h.n_past < n_ctx_ && h.n_tokens == h.n_past;
+    if (ok) { tokens.resize(h.n_tokens); if (fread(tokens.data(), 4, tokens.size(), f) != tokens.size()) tokens.clear(); }
+    fclose(f);
+    return tokens;
+}
+
 std::vector<int32_t> GpuModel::load_state(const std::string &path) {
     File f(path, "rb");
     StateHeader h;

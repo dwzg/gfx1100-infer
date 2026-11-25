@@ -50,7 +50,7 @@ the version checked here.
 build/gfxi devices                          # which device, and which hardware features are usable
 build/gfxi plan  model.gguf --vram 24       # GPU memory needed and how much context fits
 build/gfxi run   model.gguf --chat -p "Why is the sky blue?" -n 200
-build/gfxi chat  model.gguf --kv8 --ctx max                 # interactive, context kept between turns
+build/gfxi chat  model.gguf --kv8 --ctx max                 # interactive, context kept between turns (Qwen-style and Inkling models)
 build/gfxi serve model.gguf --kv8 --ctx max                 # Messages API server, e.g. for Claude Code
 build/gfxi run   model.gguf --kv8 --ctx max -p @long_prompt.txt --save-state doc.ctx   # process once
 build/gfxi run   model.gguf --kv8 --load-state doc.ctx --chat -p "Summarise it."         # reuse
@@ -69,7 +69,7 @@ build/gfxi kernels matvec_q4_k --code       # the machine code the driver genera
 speaks. Start the server, then start Claude Code with the settings the server prints:
 
 ```sh
-build/gfxi serve Qwen3.8-27B-UD-Q4_K_S.gguf --kv8 --ctx max        # listens on 127.0.0.1:8080
+build/gfxi serve Qwen3.8-27B-UD-Q4_K_S.gguf --kv8 --prompt-cache ~/.cache/gfxi   # listens on 127.0.0.1:8080
 
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 export ANTHROPIC_AUTH_TOKEN=local                       # any text, unless the server has --api-key
@@ -105,6 +105,12 @@ What the server does with a request:
   pages of 1,024 tokens, and conversations with the same beginning (two subagents with the same
   instructions, a conversation and a side question about it) share the pages of that beginning.
   When the memory runs out, conversations idle for an hour go first, then the cheapest to redo.
+- **Remembers the system prompt across restarts.** With `--prompt-cache DIR`, the processed
+  context at the end of the tool list and at the end of the system prompt is written to a file
+  the first time it is computed (if it took at least 512 tokens). A later request that begins the
+  same way, after a restart or in a new session, starts from the file instead of processing
+  Claude Code's whole prompt again. The eight most recently used files are kept; for Qwen 3.8 27B
+  with the 8-bit cache a file is roughly 35 KiB per token plus 150 MiB.
 - **Keeps reasoning in the conversation.** Earlier reasoning stays in the prompt (as Qwen 3.8's
   template does by default), so the conversation only ever grows at its end. `--drop-thinking`
   follows templates that drop it instead, at the cost of reprocessing each turn.
@@ -113,7 +119,7 @@ Options: `--think auto|on|off` (default: reason when the request enables thinkin
 Code does), `--effort low|medium|high` (overrides the request; Qwen 3.8's template has effort
 levels), `--temp/--top-k/--top-p` (defaults 0.6 / 20 / 0.95; the request's own sampling settings
 are ignored unless `--client-sampling`), `--host`, `--port`, `--api-key`, `--model-id`,
-`--conversations N`, `--checkpoints N`, `--log-prompts`, `--dump-requests DIR`.
+`--conversations N`, `--checkpoints N`, `--prompt-cache DIR`, `--log-prompts`, `--dump-requests DIR`.
 
 Limits to know about:
 
@@ -129,9 +135,8 @@ Limits to know about:
   reprocesses from the nearest earlier copy. For Qwen 3.8 27B a copy is about 150 MiB of main
   memory, and up to 8 conversations x 5 copies are kept (`--conversations`, `--checkpoints`).
 - Not implemented: images and documents (replaced by a placeholder), structured-output schemas
-  (not enforced), server-side tools such as web search (ignored), `tool_choice` beyond forcing a
-  call, and saving the processed system prompt across server restarts (the first request after a
-  start processes Claude Code's whole system prompt and tool list, about 12,000-25,000 tokens).
+  (not enforced), server-side tools such as web search (ignored), and `tool_choice` beyond forcing
+  a call.
 
 ### Getting the most context out of 24 GB
 
@@ -258,6 +263,7 @@ What was checked, and how:
 | Inkling 2 Mini, GPU engine: token by token, prompts in batches of 8, 8-bit cache, and a start at position 9,000 (ring wrap-around, distances past the bias table, position scaling) | Its CPU reference | Relative logit error 7e-5 (half precision), 4e-4 at position 9,000, about 2e-2 (8-bit); same top token throughout |
 | Conversation cache with the Inkling engine: continuing, a side request branching off, returning, a second conversation with the same beginning | Processing the same tokens from scratch | Bit-identical logits |
 | Inkling prompt formatting (32 prompts) and reply parsing (6 cases at every piece size) | Its own template run with jinja2; expected blocks | Byte-identical; all pass |
+| Prompt store: a request, a server restart, the same request and a different one | The first run | The restart begins from the stored prefix (415 of 430 tokens), gives the same answer, and the next question reuses it too |
 | Claude Code itself: CLI 2.1.332 with its default system prompt and 13 tools (12,453 prompt tokens), asked to read a file and report a value from it; Qwen 3.5 0.8B on the CPU driver | The right answer | Called its Read tool, then answered correctly; the second request reused 12,558 of 12,587 prompt tokens |
 
 Not checked:

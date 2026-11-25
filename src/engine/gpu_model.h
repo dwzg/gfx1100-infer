@@ -84,6 +84,9 @@ class GpuModel {
     // paid for once. The file is tied to the model and cache type it was written with.
     void save_state(const std::string &path, const std::vector<int32_t> &tokens);
     std::vector<int32_t> load_state(const std::string &path);   // returns the tokens it was saved with
+    // The tokens a saved context holds, without loading it; empty if the file is not a saved
+    // context of this model and cache type.
+    std::vector<int32_t> saved_tokens(const std::string &path) const;
     const std::vector<float> &logits() const { return logits_; }
 
     uint64_t weight_bytes() const { return weight_bytes_; }

@@ -10,8 +10,11 @@ fail=0
 run() { echo "--- $*"; "$@" || { echo "FAILED: $*"; fail=1; }; }
 
 shopt -s nullglob
-ggufs=("$MODELS"/*/*.gguf)
-[ ${#ggufs[@]} -gt 0 ] || { echo "no .gguf files under $MODELS/*/"; exit 2; }
+all=("$MODELS"/*/*.gguf)
+[ ${#all[@]} -gt 0 ] || { echo "no .gguf files under $MODELS/*/"; exit 2; }
+# Files of several gigabytes (Inkling 2 Mini) get their own, cheaper steps below.
+ggufs=(); big=()
+for g in "${all[@]}"; do if [ "$(stat -L -c %s "$g")" -gt 4000000000 ]; then big+=("$g"); else ggufs+=("$g"); fi; done
 
 # 1. Weight decoders against the gguf Python package (optional: needs `pip install gguf numpy`).
 if "$PY" -c "import gguf, numpy" 2>/dev/null; then
@@ -47,13 +50,14 @@ for g in "$xml_model" "$json_model"; do [ -n "$g" ] && run "$GFXI" test-context 
 if "$PY" -c "import jinja2" 2>/dev/null; then
   run "$PY" "$(dirname "$0")/test_chat.py" "$GFXI" "${ggufs[@]}"
 else echo "--- skipping chat-format test (python package jinja2 not installed)"; fi
-ink_model=$(first_of 'Inkling*')
+ink_model=; for g in "${big[@]}"; do case "$(basename "$g")" in Inkling*) ink_model=$g;; esac; done
 [ -n "$xml_model" ] && run "$PY" "$(dirname "$0")/test_reply.py" "$GFXI" "$xml_model" ${json_model:+"$json_model"} ${json_model:+${ink_model:+"$ink_model"}}
 
 # 6b. Inkling 2: the GPU engine against its CPU reference (slow; needs the whole model file).
 #     GFX_MAX_BINDING_MIB lets Mesa's CPU driver take the expert buffers; a real GPU does not need it.
-[ -n "$ink_model" ] && [ "$(stat -c %s "$ink_model")" -gt 1000000000 ] && run "$GFXI" compare "$ink_model" -p "<|message_user|><|content_text|>Name a prime.<|end_message|>" -n 2 --batch 8 --tol 0.02
-[ -n "$ink_model" ] && [ "$(stat -c %s "$ink_model")" -gt 1000000000 ] && run "$GFXI" test-context "$ink_model"
+[ -n "$ink_model" ] && run "$GFXI" compare "$ink_model" -p "<|message_user|><|content_text|>Name a prime.<|end_message|>" -n 2 --batch 8 --tol 0.02
+[ -n "$ink_model" ] && run "$GFXI" test-context "$ink_model"
+[ -n "$ink_model" ] && "$PY" -c "import jinja2" 2>/dev/null && run "$PY" "$(dirname "$0")/test_chat.py" "$GFXI" "$ink_model"
 
 # 7. Server end to end through the Anthropic SDK (optional: needs `pip install anthropic`).
 if [ -n "$xml_model" ] && "$PY" -c "import anthropic" 2>/dev/null; then
@@ -62,6 +66,7 @@ if [ -n "$xml_model" ] && "$PY" -c "import anthropic" 2>/dev/null; then
   for i in $(seq 120); do curl -s --noproxy '*' -o /dev/null "http://127.0.0.1:$port/health" && break; sleep 1; done
   NO_PROXY=127.0.0.1 no_proxy=127.0.0.1 run "$PY" "$(dirname "$0")/test_server.py" "http://127.0.0.1:$port"
   kill $server 2>/dev/null; wait $server 2>/dev/null; rm -f /tmp/gfxi-serve.$$.log
+  run "$PY" "$(dirname "$0")/test_prompt_cache.py" "$GFXI" "$xml_model" $((port + 1))
 else echo "--- skipping server test (needs a Qwen 3.5+ test model and the python package anthropic)"; fi
 
 [ $fail -eq 0 ] && echo "ALL TESTS PASSED" || echo "SOME TESTS FAILED"

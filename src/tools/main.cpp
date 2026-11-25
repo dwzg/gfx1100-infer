@@ -70,10 +70,10 @@ static int cmd_info(int argc, char **argv) {
 // Memory plan: what the model needs on the GPU and how much context fits. Works on a header-only
 // download too, since it only needs tensor shapes and types.
 // The GPU engine for whichever architecture the file holds.
-static std::unique_ptr<GpuModel> make_engine(Device &dev, const GGUF &g, int n_ctx, bool kv8, double reserve_gib, int batch) {
+static std::unique_ptr<GpuModel> make_engine(Device &dev, const GGUF &g, int n_ctx, bool kv8, double reserve_gib, int batch, bool wmma = true) {
     const uint64_t reserve = (uint64_t)(reserve_gib * 1073741824.0);
-    if (is_inkling(g)) return std::make_unique<GpuModel>(dev, g, describe_inkling(g), n_ctx, kv8, reserve, batch);
-    return std::make_unique<GpuModel>(dev, g, describe_model(g), n_ctx, false, kv8, reserve, batch);
+    if (is_inkling(g)) return std::make_unique<GpuModel>(dev, g, describe_inkling(g), n_ctx, kv8, reserve, batch, wmma);
+    return std::make_unique<GpuModel>(dev, g, describe_model(g), n_ctx, false, kv8, reserve, batch, wmma);
 }
 
 // Memory plan for an Inkling 2 model.
@@ -344,10 +344,12 @@ static int cmd_chat(int argc, char **argv) {
         return 2;
     }
     GGUF g; g.open(argv[0]);
-    ModelDesc desc = describe_model(g);
+    const bool inkling = is_inkling(g);
+    const std::string model_name = g.get_str("general.name");
     Tokenizer tok(g);
     ChatFormat cf = detect_chat_format(g);
-    if (!cf.supported) throw std::runtime_error("this model's chat template (" + cf.name + ") is not supported");
+    if (!cf.supported && !inkling) throw std::runtime_error("this model's chat template (" + cf.name + ") is not supported");
+    const ChatTemplate tmpl = ChatTemplate::detect(g);   // used to read Inkling's replies
     std::string system_prompt, device, load_path; bool think = true, kv8 = false, ctx_max = false; int n_reply = 2048, n_ctx = 8192, batch = 32; double reserve_gib = 0.25;
     // Sampling defaults: what the model file recommends, if it says.
     SamplerParams sp;
@@ -371,8 +373,9 @@ static int cmd_chat(int argc, char **argv) {
         else throw std::runtime_error("unknown option " + a);
     }
     Device dev(device);
-    fprintf(stderr, "[%s] loading %s ...\n", dev.caps().name.c_str(), desc.name.c_str());
-    GpuModel gpu(dev, g, desc, ctx_max ? 0 : n_ctx, false, kv8, (uint64_t)(reserve_gib * 1073741824.0), batch);
+    fprintf(stderr, "[%s] loading %s ...\n", dev.caps().name.c_str(), model_name.c_str());
+    std::unique_ptr<GpuModel> engine = make_engine(dev, g, ctx_max ? 0 : n_ctx, kv8, reserve_gib, batch);
+    GpuModel &gpu = *engine;
     if (dev.caps().coop_matrix) fprintf(stderr, "[matrix instructions verified for: %s]\n", gpu.wmma_report().empty() ? "(disabled)" : gpu.wmma_report().c_str());
     Sampler sampler(sp);
     bool first = true;
@@ -387,10 +390,19 @@ static int cmd_chat(int argc, char **argv) {
         int ch; while ((ch = getchar()) != EOF && ch != '\n') line += (char)ch;
         if (ch == EOF && line.empty()) break;
         if (line.empty()) continue;
-        std::string text = reply_open ? cf.reply_end() : "";
-        if (first && !system_prompt.empty()) text += cf.message("system", system_prompt);
-        text += cf.message("user", line) + cf.reply_start(think);
-        std::vector<int32_t> ids = tok.encode(text, first, true);
+        std::string text;
+        if (inkling) {
+            // Inkling's messages: a system note sets the thinking effort; the model opens its reply itself.
+            text = reply_open ? "<|content_model_end_sampling|>" : "";
+            if (first) text += (system_prompt.empty() ? "" : "<|message_system|><|content_text|>" + system_prompt + "<|end_message|>") +
+                               "<|message_system|><|content_text|>Thinking effort level: " + (think ? "0.9" : "0") + "<|end_message|>";
+            text += "<|message_user|><|content_text|>" + line + "<|end_message|>";
+        } else {
+            text = reply_open ? cf.reply_end() : "";
+            if (first && !system_prompt.empty()) text += cf.message("system", system_prompt);
+            text += cf.message("user", line) + cf.reply_start(think);
+        }
+        std::vector<int32_t> ids = tok.encode(text, first && !inkling, true);
         first = false;
         if (gpu.n_past() + (int)ids.size() + 1 >= gpu.n_ctx()) { fprintf(stderr, "[the context is full: %d of %d tokens used]\n", gpu.n_past(), gpu.n_ctx()); break; }
         auto t0 = std::chrono::steady_clock::now();
@@ -398,15 +410,32 @@ static int cmd_chat(int argc, char **argv) {
         double t_prompt = seconds_since(t0);
         std::string pending; int n_gen = 0;
         auto t1 = std::chrono::steady_clock::now();
+        // Inkling's reply is a series of typed messages; show their text, with the reasoning marked.
+        ReplyParser parser(tmpl, Json::array(), false);
+        std::vector<ReplyEvent> events;
+        auto show = [&] {
+            for (const ReplyEvent &e : events) {
+                if (e.kind == ReplyEvent::ThinkingStart) fputs("[thinking] ", stdout);
+                else if (e.kind == ReplyEvent::ThinkingDelta || e.kind == ReplyEvent::TextDelta) fwrite(e.text.data(), 1, e.text.size(), stdout);
+                else if (e.kind == ReplyEvent::ToolStart) printf("[tool call %s] ", e.text.c_str());
+                else if (e.kind == ReplyEvent::ToolDelta) fwrite(e.text.data(), 1, e.text.size(), stdout);
+                else if (e.kind == ReplyEvent::BlockStop) fputc('\n', stdout);
+            }
+            events.clear(); fflush(stdout);
+        };
         while (n_gen < n_reply && gpu.n_past() + 1 < gpu.n_ctx()) {
             int32_t t = sampler.sample(logits->data(), (int)logits->size());
             if (tok.is_eog(t)) break;
-            pending += tok.piece(t);
-            size_t ok = utf8_complete_prefix(pending);
-            fwrite(pending.data(), 1, ok, stdout); fflush(stdout); pending.erase(0, ok);
+            if (inkling) { parser.feed(tok.piece(t), events); show(); }
+            else {
+                pending += tok.piece(t);
+                size_t ok = utf8_complete_prefix(pending);
+                fwrite(pending.data(), 1, ok, stdout); fflush(stdout); pending.erase(0, ok);
+            }
             logits = &gpu.eval(&t, 1); n_gen++;
         }
-        fwrite(pending.data(), 1, pending.size(), stdout); printf("\n"); fflush(stdout);
+        if (inkling) { parser.finish(true, events); show(); }
+        else { fwrite(pending.data(), 1, pending.size(), stdout); printf("\n"); fflush(stdout); }
         reply_open = true;
         fprintf(stderr, "[%d prompt tokens in %.2f s, %d reply tokens at %.1f tok/s, context %d / %d]\n", (int)ids.size(), t_prompt, n_gen,
                 n_gen ? n_gen / seconds_since(t1) : 0.0, gpu.n_past(), gpu.n_ctx());
@@ -681,7 +710,7 @@ static int cmd_serve(int argc, char **argv) {
                         "                  [--ctx N|max] [--reserve GiB] [--kv8] [--batch N] [--device name]\n"
                         "                  [--think auto|on|off] [--effort low|medium|high] [--drop-thinking]\n"
                         "                  [--temp T] [--top-k K] [--top-p P] [--client-sampling]\n"
-                        "                  [--conversations N] [--checkpoints N] [--log-prompts] [--dump-requests DIR]\n");
+                        "                  [--conversations N] [--checkpoints N] [--prompt-cache DIR] [--log-prompts] [--dump-requests DIR]\n");
         return 2;
     }
     ServerOptions so; so.sampling.temperature = 0.6f; so.sampling.top_k = 20; so.sampling.top_p = 0.95f;
@@ -709,6 +738,8 @@ static int cmd_serve(int argc, char **argv) {
         else if (a == "--checkpoints") so.cache.max_checkpoints = std::max(1, atoi(next()));
         else if (a == "--log-prompts") so.log_prompts = true;
         else if (a == "--dump-requests") so.dump_dir = next();
+        else if (a == "--prompt-cache") so.cache.store_dir = next();
+        else if (a == "--prompt-cache-min") so.cache.store_min_tokens = std::max(1, atoi(next()));
         else throw std::runtime_error("unknown option " + a);
     }
     GGUF g; g.open(argv[0]);
@@ -833,15 +864,15 @@ static int cmd_bench(int argc, char **argv) {
     printf("device %s (driver %s), kernels built for wave size %s\n", c.name.c_str(), c.driver.c_str(), wave ? std::to_string(wave).c_str() : "default");
     if (!model.empty()) {
         GGUF g; g.open(model);
-        ModelDesc desc = describe_model(g);
         int n_ctx = n_tokens + 8;
         auto t0 = std::chrono::steady_clock::now();
-        GpuModel gpu(dev, g, desc, n_ctx, false, kv8, 256ull << 20, batch, !no_wmma);
-        printf("%s: loaded in %.1f s, weights %.2f GiB, %zu dispatches and %zu sync points per token\n", desc.name.c_str(), seconds_since(t0),
+        std::unique_ptr<GpuModel> engine = make_engine(dev, g, n_ctx, kv8, 0.25, batch, !no_wmma);
+        GpuModel &gpu = *engine;
+        printf("%s: loaded in %.1f s, weights %.2f GiB, %zu dispatches and %zu sync points per token\n", g.get_str("general.name").c_str(), seconds_since(t0),
                gpu.weight_bytes() / 1073741824.0, gpu.dispatches_per_token(), gpu.barriers_per_token());
         if (dev.caps().coop_matrix) printf("matrix-instruction kernels verified for: %s\n", gpu.wmma_report().empty() ? "(disabled)" : gpu.wmma_report().c_str());
         std::vector<int32_t> toks(n_tokens);
-        for (int i = 0; i < n_tokens; i++) toks[i] = (int32_t)((1000003ull * (i + 1)) % (uint64_t)desc.n_vocab);
+        for (int i = 0; i < n_tokens; i++) toks[i] = (int32_t)((1000003ull * (i + 1)) % (uint64_t)gpu.logits().size());
         // Prompt speed: whole batches.
         int np = std::max(1, n_tokens / gpu.batch()) * gpu.batch();
         if (np <= n_tokens && gpu.batch() > 1) {

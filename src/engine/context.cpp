@@ -1,6 +1,8 @@
 #include "context.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
 
 #include "gpu_model.h"
 
@@ -96,6 +98,25 @@ void ContextCache::make_room(int upto) {
         if (!evict_one(cur_)) throw ContextFull(upto, m_.n_ctx());
 }
 
+// The file that holds the processed first n tokens of a prompt.
+std::string ContextCache::store_path(const std::vector<int32_t> &prompt, int n) const {
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < n; i++) for (int b = 0; b < 4; b++) { h ^= (uint8_t)(prompt[i] >> (8 * b)); h *= 1099511628211ull; }
+    char name[64];
+    snprintf(name, sizeof name, "/prefix-%d-%016llx.ctx", n, (unsigned long long)h);
+    return o_.store_dir + name;
+}
+
+void ContextCache::store_prune() const {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    std::vector<std::pair<fs::file_time_type, fs::path>> files;
+    for (const auto &e : fs::directory_iterator(o_.store_dir, ec))
+        if (e.path().extension() == ".ctx") files.emplace_back(e.last_write_time(ec), e.path());
+    std::sort(files.begin(), files.end());
+    for (size_t i = 0; i + o_.store_max_files < files.size(); i++) fs::remove(files[i].second, ec);
+}
+
 ContextCache::Result ContextCache::prepare(const std::vector<int32_t> &prompt, const std::vector<int> &marks, const Progress &progress) {
     const int n = (int)prompt.size();
     if (n == 0) throw std::runtime_error("empty prompt");
@@ -123,7 +144,37 @@ ContextCache::Result ContextCache::prepare(const std::vector<int32_t> &prompt, c
 
     Result res;
     std::shared_ptr<const std::vector<uint8_t>> state = from ? from->state : nullptr;   // survives changes to the checkpoint lists
-    if (!live || p == 0) {
+    std::vector<int> stops(marks);
+    std::sort(stops.begin(), stops.end());
+    // A stored file may reach further than anything in memory.
+    std::string file; int file_n = 0;
+    if (!o_.store_dir.empty())
+        for (auto it = stops.rbegin(); it != stops.rend() && file.empty(); ++it) {
+            const int mk = *it;
+            if (mk <= p || mk >= n || mk - p < o_.store_min_tokens) continue;
+            const std::string path = store_path(prompt, mk);
+            std::vector<int32_t> have = m_.saved_tokens(path);
+            if ((int)have.size() == mk && std::equal(have.begin(), have.end(), prompt.begin())) { file = path; file_n = mk; }
+        }
+    if (!file.empty()) {
+        leave_current();
+        Conv *target = nullptr;
+        for (auto &c : convs_) if (c->tokens.empty()) target = c.get();
+        if (!target) target = add_conv(m_.seq_create());
+        m_.seq_select(target->seq);
+        Conv *old = cur_;
+        cur_ = target;
+        if (old && old != target && old->tokens.empty()) destroy(old);
+        while (m_.pages_needed(cur_->seq, file_n) > m_.pages_free())
+            if (!evict_one(cur_)) throw ContextFull(n, m_.n_ctx());
+        m_.load_state(file);
+        cur_->tokens.assign(prompt.begin(), prompt.begin() + file_n);
+        cur_->cps.clear();
+        checkpoint(*cur_, true);
+        std::error_code ec;
+        std::filesystem::last_write_time(file, std::filesystem::file_time_type::clock::now(), ec);   // recently used
+        p = file_n; res.from_disk = file_n;
+    } else if (!live || p == 0) {
         leave_current();
         Conv *target;
         if (p == 0) {
@@ -157,9 +208,7 @@ ContextCache::Result ContextCache::prepare(const std::vector<int32_t> &prompt, c
 
     const int chunk = std::max(1, m_.batch());
     size_t next_mark = 0;
-    std::vector<int> stops(marks);
-    std::sort(stops.begin(), stops.end());
-    int done = p;
+    int done = p, last_stored = p;
     while (done < n) {
         while (next_mark < stops.size() && stops[next_mark] <= done) next_mark++;
         int upto = std::min(n, done + chunk);
@@ -167,7 +216,20 @@ ContextCache::Result ContextCache::prepare(const std::vector<int32_t> &prompt, c
         m_.eval(prompt.data() + done, upto - done);
         cur_->tokens.insert(cur_->tokens.end(), prompt.begin() + done, prompt.begin() + upto);
         done = upto;
-        if (recurrent_ && next_mark < stops.size() && stops[next_mark] == done) checkpoint(*cur_, true);
+        if (next_mark < stops.size() && stops[next_mark] == done) {
+            if (recurrent_) checkpoint(*cur_, true);
+            if (!o_.store_dir.empty() && done - last_stored >= o_.store_min_tokens) {
+                // Worth keeping on disk: the next start, or a new conversation, begins here.
+                const std::string path = store_path(prompt, done);
+                std::error_code ec;
+                std::filesystem::create_directories(o_.store_dir, ec);
+                if (!std::filesystem::exists(path, ec)) {
+                    try { m_.save_state(path + ".part", cur_->tokens); std::filesystem::rename(path + ".part", path, ec); store_prune(); }
+                    catch (const std::exception &) { std::filesystem::remove(path + ".part", ec); }
+                }
+                last_stored = done;
+            }
+        }
         if (progress && done < n && !progress(done, n)) { res.cancelled = true; break; }
     }
     res.evaluated = done - p;

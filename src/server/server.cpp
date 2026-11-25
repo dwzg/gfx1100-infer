@@ -455,6 +455,7 @@ class Service {
         const std::string state = cache_.summary();
         gpu.unlock();
 
+        if (prep.from_disk) logf("started from %d stored tokens of processed prompt", prep.from_disk);
         logf("%s%d prompt tokens (%d reused, %d processed in %.1f s%s), %d generated in %.1f s (%.1f tok/s), %s; %s", cancelled ? "cancelled: " : "", n_prompt, prep.reused, prep.evaluated,
              t_prompt, waited > 0.5 ? (", waited " + std::to_string((int)waited) + " s").c_str() : "", n_out, t_gen, n_out > 1 && t_gen > 0 ? n_out / t_gen : 0.0, stop_reason.c_str(), state.c_str());
         if (opt_.log_prompts) logf("reply:\n%s", blocks.dump().c_str());
