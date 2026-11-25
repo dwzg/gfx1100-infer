@@ -19,6 +19,10 @@ class GGUF;
 struct ChatTemplate {
     bool supported = false;
     std::string problem;                    // why not, if not supported
+    // ChatML: <|im_start|>role ... <|im_end|> (Qwen and many others). Inkling: its own typed messages,
+    // <|message_ROLE|><|content_KIND|> ... <|end_message|>.
+    enum class Family { ChatML, Inkling } family = Family::ChatML;
+    std::string body_end;                   // text that ends a reply and is part of the message itself (Inkling's end-of-sampling token)
     enum class ToolStyle { Json, Xml } tool_style = ToolStyle::Json;
     bool tools_first = false;               // the tool list comes before the system text
     bool trim = false;                      // message text is trimmed
@@ -68,6 +72,7 @@ struct Prompt {
     std::vector<Piece> pieces;
     bool has_system = false;        // pieces[0] is the system message
     size_t tools_bytes = 0;         // bytes of pieces[0] up to the end of the tool list (0: not applicable)
+    size_t mark_pieces = 0;         // the ends of this many leading pieces are worth a checkpoint (Inkling: tools, system text)
     MarkedText reply_prefix;        // how the reply's body starts (already part of the prompt)
     std::string fed_to_parser;      // the part of reply_prefix the reply parser must see (a forced tool call)
     bool starts_reasoning = false;  // the reply starts inside <think>

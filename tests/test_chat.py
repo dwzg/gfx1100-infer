@@ -9,7 +9,7 @@ calls and results, reasoning) and the result is compared with `gfxi render`, byt
 
 A model file may be truncated after its header.
 """
-import json, struct, subprocess, sys, tempfile, os
+import json, re, struct, subprocess, sys, tempfile, os
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -48,8 +48,10 @@ def raise_exception(msg): raise jinja2.exceptions.TemplateError(msg)
 
 def run_template(text, messages, tools, **kw):
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
-    env.filters['tojson'] = lambda x, ensure_ascii=False, indent=None: json.dumps(x, ensure_ascii=ensure_ascii, indent=indent)
+    env.filters['tojson'] = lambda x, ensure_ascii=False, indent=None, separators=None, sort_keys=False: json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
     env.globals['raise_exception'] = raise_exception
+    # "generation" marks the assistant's part for training tools; it does not change the text.
+    text = re.sub(r'\{%-?\s*(end)?generation\s*-?%\}', '', text)
     return env.from_string(text).render(messages=messages, tools=tools or None, add_generation_prompt=True, **kw)
 
 
@@ -65,13 +67,13 @@ def to_openai(req):
             msg = {'role': 'assistant', 'content': ''.join(b['text'] for b in c if b['type'] == 'text')}
             think = [b['thinking'] for b in c if b['type'] == 'thinking']
             if think: msg['reasoning_content'] = think[0]
-            calls = [{'type': 'function', 'function': {'name': b['name'], 'arguments': b['input']}} for b in c if b['type'] == 'tool_use']
+            calls = [{'type': 'function', 'id': b['id'], 'function': {'name': b['name'], 'arguments': b['input']}} for b in c if b['type'] == 'tool_use']
             if calls: msg['tool_calls'] = calls
             out.append(msg)
         else:
             text = [b['text'] for b in c if b['type'] == 'text']
             for b in c:
-                if b['type'] == 'tool_result': out.append({'role': 'tool', 'content': b['content']})
+                if b['type'] == 'tool_result': out.append({'role': 'tool', 'tool_call_id': b['tool_use_id'], 'content': b['content']})
             if text: out.append({'role': 'user', 'content': '\n'.join(text)})
     tools = [{'type': 'function', 'function': {'name': t['name'], 'description': t['description'], 'parameters': t['input_schema']}} for t in req.get('tools', [])]
     return out, tools
@@ -117,19 +119,21 @@ def main():
     failed = total = 0
     for model in models:
         text = chat_template(model)
-        if '<|im_start|>' not in text:
-            print(f'{os.path.basename(model)}: not a ChatML template, skipped'); continue
+        inkling = '<|message_user|>' in text
+        if '<|im_start|>' not in text and not inkling:
+            print(f'{os.path.basename(model)}: not a supported template, skipped'); continue
         # What the template itself does with reasoning from earlier turns, and whether it has effort levels.
         keeps = 'preserve_thinking' in text
         modes = [(False, None), (True, None)]
         if 'reasoning_effort' in text: modes += [(True, 'low'), (True, 'medium')]
         for name, req in CASES.items():
-            if 'tools' in req and '<tool_call>' not in text: continue
+            if 'tools' in req and '<tool_call>' not in text and not inkling: continue
             if 'messages[0].content +' in text and any(not isinstance(m['content'], str) and m['role'] == 'user' and len(m['content']) > 1 for m in req['messages']): pass
             for think, effort in modes:
                 messages, tools = to_openai(req)
                 kw = {'enable_thinking': think}
                 if effort: kw['reasoning_effort'] = effort
+                if inkling and not think: kw['reasoning_effort'] = 'none'
                 try: want = run_template(text, messages, tools, **kw)
                 except jinja2.exceptions.TemplateError as e:
                     print(f'  (template rejects "{name}": {e})'); continue

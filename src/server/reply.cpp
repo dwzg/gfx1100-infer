@@ -41,6 +41,8 @@ ReplyParser::ReplyParser(const ChatTemplate &t, const Json &tools, bool in_reaso
     : xml_(t.tool_style == ChatTemplate::ToolStyle::Xml), tools_(tools), stops_(std::move(stop_sequences)), state_(in_reasoning ? State::Reasoning : State::Content) {
     stops_.erase(std::remove_if(stops_.begin(), stops_.end(), [](const std::string &s) { return s.empty(); }), stops_.end());
     content_started_ = in_reasoning || !t.reasoning;   // otherwise the reply may still open with <think>
+    inkling_ = t.family == ChatTemplate::Family::Inkling;
+    if (inkling_) xml_ = false;
 }
 
 void ReplyParser::feed(std::string_view text, std::vector<ReplyEvent> &out) {
@@ -226,7 +228,73 @@ bool ReplyParser::step_tool(std::vector<ReplyEvent> &out, bool final) {
     return false;
 }
 
+// Inkling: the reply is a series of messages, <|message_model|>[tool name]<|content_KIND|> ... <|end_message|>,
+// with KIND one of thinking, text, or invoke_tool_json ({"name": ..., "args": {...}}).
+void ReplyParser::step_inkling(std::vector<ReplyEvent> &out, bool final) {
+    static const std::string_view k_open = "<|message_model|>", k_end = "<|end_message|>";
+    static const std::string_view k_kinds[3] = {"<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>"};
+    for (;;) {
+        if (stopped_) return;
+        if (msg_ == Msg::Outside) {
+            size_t at = buf_.find(k_open);
+            // Anything outside a message is ordinary text (the model should not write any).
+            size_t n = at != std::string::npos ? at : buf_.size() - (final ? 0 : partial_tail(buf_, k_open));
+            if (at == std::string::npos && !final) n = utf8_complete_prefix(std::string_view(buf_).substr(0, n));
+            if (n > 0) { emit_text(State::Content, std::string_view(buf_).substr(0, n), out); buf_.erase(0, n); }
+            if (at == std::string::npos) return;
+            close_block(out);
+            buf_.erase(0, k_open.size());
+            msg_ = Msg::Header;
+        } else if (msg_ == Msg::Header) {
+            size_t at = std::string::npos; int kind = -1;
+            for (int i = 0; i < 3; i++) { size_t p = buf_.find(k_kinds[i]); if (p < at) { at = p; kind = i; } }
+            if (kind < 0) { if (final) buf_.clear(); return; }
+            msg_name_ = std::string(strip(std::string_view(buf_).substr(0, at)));
+            buf_.erase(0, at + k_kinds[kind].size());
+            msg_ = kind == 0 ? Msg::Thinking : kind == 1 ? Msg::Text : Msg::Tool;
+        } else if (msg_ == Msg::Tool) {
+            size_t end = buf_.find(k_end);
+            if (end == std::string::npos && !final) return;
+            const std::string body = buf_.substr(0, std::min(end, buf_.size()));
+            buf_.erase(0, end == std::string::npos ? buf_.size() : end + k_end.size());
+            msg_ = Msg::Outside;
+            try {
+                Json call = Json::parse(strip(body));
+                const Json &args = call["args"];
+                if (!(args.is_object() || args.is_null())) throw std::runtime_error("not a call");
+                start_tool(call["name"].is_string() ? call["name"].str() : msg_name_, out);
+                tool_input_ = args.is_object() ? args : Json::object();
+                tool_delta(tool_input_.dump(), out);
+                end_tool(true, out);
+            } catch (const std::exception &) {
+                if (strip(body).empty()) continue;
+                emit_text(State::Content, body, out);   // not a call after all
+                close_block(out);
+            }
+        } else {
+            const State st = msg_ == Msg::Thinking ? State::Reasoning : State::Content;
+            size_t at = buf_.find(k_end), stop_index = 0; bool is_stop = false;
+            if (msg_ == Msg::Text)
+                for (size_t i = 0; i < stops_.size(); i++) { size_t p = buf_.find(stops_[i]); if (p < at) { at = p; is_stop = true; stop_index = i; } }
+            if (at == std::string::npos) {
+                size_t keep = final ? 0 : partial_tail(buf_, k_end);
+                if (!final && msg_ == Msg::Text) for (const std::string &s : stops_) keep = std::max(keep, partial_tail(buf_, s));
+                size_t n = buf_.size() - keep;
+                if (!final) n = utf8_complete_prefix(std::string_view(buf_).substr(0, n));
+                if (n > 0) { emit_text(st, std::string_view(buf_).substr(0, n), out); buf_.erase(0, n); }
+                return;
+            }
+            emit_text(st, std::string_view(buf_).substr(0, at), out);
+            close_block(out);
+            if (is_stop) { stopped_ = true; stop_hit_ = stops_[stop_index]; buf_.clear(); return; }
+            buf_.erase(0, at + k_end.size());
+            msg_ = Msg::Outside;
+        }
+    }
+}
+
 void ReplyParser::step(std::vector<ReplyEvent> &out, bool final) {
+    if (inkling_) { step_inkling(out, final); return; }
     for (;;) {
         if (stopped_) return;
         if (state_ == State::Tool) { if (!step_tool(out, final)) return; continue; }

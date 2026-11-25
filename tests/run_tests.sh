@@ -47,7 +47,12 @@ for g in "$xml_model" "$json_model"; do [ -n "$g" ] && run "$GFXI" test-context 
 if "$PY" -c "import jinja2" 2>/dev/null; then
   run "$PY" "$(dirname "$0")/test_chat.py" "$GFXI" "${ggufs[@]}"
 else echo "--- skipping chat-format test (python package jinja2 not installed)"; fi
-[ -n "$xml_model" ] && run "$PY" "$(dirname "$0")/test_reply.py" "$GFXI" "$xml_model" ${json_model:+"$json_model"}
+ink_model=$(first_of 'Inkling*')
+[ -n "$xml_model" ] && run "$PY" "$(dirname "$0")/test_reply.py" "$GFXI" "$xml_model" ${json_model:+"$json_model"} ${json_model:+${ink_model:+"$ink_model"}}
+
+# 6b. Inkling 2: the GPU engine against its CPU reference (slow; needs the whole model file).
+#     GFX_MAX_BINDING_MIB lets Mesa's CPU driver take the expert buffers; a real GPU does not need it.
+[ -n "$ink_model" ] && [ "$(stat -c %s "$ink_model")" -gt 1000000000 ] && run "$GFXI" compare "$ink_model" -p "<|message_user|><|content_text|>Name a prime.<|end_message|>" -n 2 --batch 8 --tol 0.02
 
 # 7. Server end to end through the Anthropic SDK (optional: needs `pip install anthropic`).
 if [ -n "$xml_model" ] && "$PY" -c "import anthropic" 2>/dev/null; then

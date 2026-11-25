@@ -69,6 +69,49 @@ static int cmd_info(int argc, char **argv) {
 
 // Memory plan: what the model needs on the GPU and how much context fits. Works on a header-only
 // download too, since it only needs tensor shapes and types.
+// The GPU engine for whichever architecture the file holds.
+static std::unique_ptr<GpuModel> make_engine(Device &dev, const GGUF &g, int n_ctx, bool kv8, double reserve_gib, int batch) {
+    const uint64_t reserve = (uint64_t)(reserve_gib * 1073741824.0);
+    if (is_inkling(g)) return std::make_unique<GpuModel>(dev, g, describe_inkling(g), n_ctx, kv8, reserve, batch);
+    return std::make_unique<GpuModel>(dev, g, describe_model(g), n_ctx, false, kv8, reserve, batch);
+}
+
+// Memory plan for an Inkling 2 model.
+static int plan_inkling(const GGUF &g, double vram, double reserve) {
+    InklingDesc d = describe_inkling(g);
+    const double GiB = 1073741824.0;
+    uint64_t native = 0, small = 0;
+    auto matrix = [&](const TensorInfo *t) {
+        const PackFormat *pf = pack_format(t->type);
+        const uint64_t rows = t->nelems / t->dim(0);
+        if (pf && t->dim(0) % pf->sb_cols == 0) native += (t->dim(0) / pf->sb_cols) * pf->sb_words * 4 * ((rows + 63) / 64 * 64);
+        else native += t->nelems * 2;
+    };
+    for (const InklingLayer &l : d.layers) {
+        for (const TensorInfo *t : {l.wq, l.wk, l.wv, l.wo, l.wgate, l.rel, l.gate_up, l.down}) matrix(t);
+        for (const TensorInfo *t : {l.sink, l.q_clip, l.rel_clip, l.rel_bias, l.k_conv, l.v_conv, l.attn_conv, l.ffn_conv, l.attn_norm, l.q_norm, l.k_norm, l.v_norm, l.k_taps, l.v_taps,
+                                    l.attn_query, l.ffn_query, l.ffn_norm, l.router, l.router_bias, l.gate_up_scale, l.down_scale, l.msg_query, l.ctrl_down[0], l.ctrl_down[1], l.ctrl_down[2],
+                                    l.ctrl_down[3], l.ctrl_gain[0], l.ctrl_gain[1], l.ctrl_gain[2], l.ctrl_gain[3], l.ctrl_forget[0], l.ctrl_forget[1], l.ctrl_forget[2], l.ctrl_forget[3]})
+            if (t) small += t->nelems * 4;
+    }
+    matrix(d.output);
+    const uint64_t weights = native + small, kv16 = GpuModel::bytes_per_token(d, false), kv8 = GpuModel::bytes_per_token(d, true);
+    const int windows = d.n_slots() - d.n_full_slots();
+    auto fixed = [&](uint64_t per_token_full) { return (uint64_t)windows * (per_token_full / d.n_full_slots()) * (d.window + 64) + (uint64_t)d.n_slots() * d.conv_channels() * (d.n_conv - 1) * 4; };
+    printf("model            %s (%s), %d layers in %d cache slots, %d of them with a context-length cache\n", d.name.c_str(), g.architecture.c_str(), d.n_layer, d.n_slots(), d.n_full_slots());
+    printf("weights on GPU   %.2f GiB  (%d experts per layer, %d used per token)\n", weights / GiB, d.n_expert, d.n_expert_used);
+    printf("embedding table  stays on the CPU (%.2f GiB in the file)\n", d.tok_embd->nbytes / GiB);
+    printf("fixed state      %.2f GiB half precision, %.2f GiB 8-bit  (sliding-window caches of %d slots, independent of context)\n", fixed(kv16) / GiB, fixed(kv8) / GiB, windows);
+    printf("cache per token  %.1f KiB half precision, %.1f KiB 8-bit\n", kv16 / 1024.0, kv8 / 1024.0);
+    printf("budget           %.1f GiB GPU memory, %.2f GiB kept free for the desktop and driver\n", vram, reserve);
+    const double base = (vram - reserve) * GiB - (double)weights - 0.35 * GiB;   // 0.35 GiB working buffers
+    const double free16 = base - (double)fixed(kv16), free8 = base - (double)fixed(kv8);
+    if (free8 <= 0) { printf("does not fit: weights alone exceed the budget by %.2f GiB\n", -free8 / GiB); return 1; }
+    auto capped = [&](double f, uint64_t per) { long v = f > 0 ? (long)(f / per) : 0; return d.n_ctx_train > 0 && v > d.n_ctx_train ? (long)d.n_ctx_train : v; };
+    printf("context that fits  %ld tokens (half-precision cache), %ld tokens (8-bit cache); the model was trained for %d\n", capped(free16, kv16), capped(free8, kv8), d.n_ctx_train);
+    return 0;
+}
+
 static int cmd_plan(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "usage: gfxi plan <model.gguf> [--vram GiB] [--reserve GiB] [--ctx N]\n"); return 2; }
     double vram = 24.0, reserve = 0.75; long ctx = 0;
@@ -81,6 +124,7 @@ static int cmd_plan(int argc, char **argv) {
         else throw std::runtime_error("unknown option " + a);
     }
     GGUF g; g.open(argv[0], true);
+    if (is_inkling(g)) return plan_inkling(g, vram, reserve);
     ModelDesc d = describe_model(g);
     const double GiB = 1073741824.0;
     // Weights that live on the GPU: every matrix the forward pass multiplies by, in its native layout
@@ -218,7 +262,6 @@ static int cmd_run(int argc, char **argv) {
     const bool inkling = is_inkling(g);
     ModelDesc desc; InklingDesc idesc;
     if (inkling) { idesc = describe_inkling(g); desc.name = idesc.name; } else desc = describe_model(g);
-    if (inkling && device != "cpu") throw std::runtime_error("Inkling 2 models only run on the reference CPU path so far: add --device cpu");
     Tokenizer tok(g);
     if (chat && inkling) {
         // Inkling's own message format: a system note sets the thinking effort, the model opens its reply itself.
@@ -236,7 +279,7 @@ static int cmd_run(int argc, char **argv) {
     if (n_ctx <= 0) n_ctx = (int)ids.size() + n_predict + 1;
     std::unique_ptr<RefModel> ref; std::unique_ptr<InklingRef> iref; std::unique_ptr<Device> dev; std::unique_ptr<GpuModel> gpu;
     std::function<const std::vector<float> &(const int32_t *, int)> eval;
-    if (inkling) {
+    if (inkling && device == "cpu") {
         fprintf(stderr, "[reference CPU path] %s: %d layers in %d cache slots (%d attend to everything), %d of %d experts per token, %d prompt tokens\n", idesc.name.c_str(), idesc.n_layer,
                 idesc.n_slots(), idesc.n_full_slots(), idesc.n_expert_used, idesc.n_expert, (int)ids.size());
         iref = std::make_unique<InklingRef>(g, idesc, n_ctx, threads);
@@ -248,7 +291,7 @@ static int cmd_run(int argc, char **argv) {
     } else {
         dev = std::make_unique<Device>(device == "gpu" ? "" : device);
         fprintf(stderr, "[%s] loading %s ...\n", dev->caps().name.c_str(), desc.name.c_str());
-        gpu = std::make_unique<GpuModel>(*dev, g, desc, ctx_max ? 0 : n_ctx, false, kv8, (uint64_t)(reserve_gib * 1073741824.0), batch);
+        gpu = make_engine(*dev, g, ctx_max ? 0 : n_ctx, kv8, reserve_gib, batch);
         if (dev->caps().coop_matrix) fprintf(stderr, "[matrix instructions verified for: %s]\n", gpu->wmma_report().empty() ? "(disabled)" : gpu->wmma_report().c_str());
         if ((int)ids.size() >= gpu->n_ctx()) throw std::runtime_error("the prompt (" + std::to_string(ids.size()) + " tokens) does not fit the context (" + std::to_string(gpu->n_ctx()) + ")");
         fprintf(stderr, "[%s] weights %.2f GiB, context %d tokens (%s cache, %.2f GiB), %zu dispatches and %zu sync points per token, %d prompt tokens\n", dev->caps().name.c_str(),
@@ -582,7 +625,7 @@ static int cmd_serve(int argc, char **argv) {
         else throw std::runtime_error("unknown option " + a);
     }
     GGUF g; g.open(argv[0]);
-    ModelDesc desc = describe_model(g);
+    const std::string model_name = g.get_str("general.name");
     Tokenizer tok(g);
     ChatTemplate tmpl = ChatTemplate::detect(g);
     if (!tmpl.supported) throw std::runtime_error("cannot serve this model: " + tmpl.problem);
@@ -592,14 +635,15 @@ static int cmd_serve(int argc, char **argv) {
         so.model_id = path.substr(slash == std::string::npos ? 0 : slash + 1, dot == std::string::npos ? std::string::npos : dot - (slash == std::string::npos ? 0 : slash + 1));
     }
     Device dev(device);
-    fprintf(stderr, "[%s] loading %s ...\n", dev.caps().name.c_str(), desc.name.c_str());
-    GpuModel gpu(dev, g, desc, n_ctx, false, kv8, (uint64_t)(reserve_gib * 1073741824.0), batch);
+    fprintf(stderr, "[%s] loading %s ...\n", dev.caps().name.c_str(), model_name.c_str());
+    std::unique_ptr<GpuModel> engine = make_engine(dev, g, n_ctx, kv8, reserve_gib, batch);
+    GpuModel &gpu = *engine;
     if (dev.caps().coop_matrix) fprintf(stderr, "[matrix instructions verified for: %s]\n", gpu.wmma_report().empty() ? "(disabled)" : gpu.wmma_report().c_str());
     fprintf(stderr, "[%s] weights %.2f GiB, context %d tokens in %d pages (%s cache, %.2f GiB)\n", dev.caps().name.c_str(), gpu.weight_bytes() / 1073741824.0, gpu.n_ctx(), gpu.pages_total(),
             kv8 ? "8-bit" : "half-precision", gpu.state_bytes() / 1073741824.0);
     fprintf(stderr, "[chat format: %s]\n", tmpl.describe().c_str());
     if (gpu.has_recurrent_state())
-        fprintf(stderr, "[each checkpoint of the linear-attention state takes %.0f MiB of main memory; up to %d conversations with %d checkpoints each are kept]\n", gpu.state_size() / 1048576.0,
+        fprintf(stderr, "[each checkpoint of the state outside the paged caches takes %.0f MiB of main memory; up to %d conversations with %d checkpoints each are kept]\n", gpu.state_size() / 1048576.0,
                 so.cache.max_conversations, so.cache.max_checkpoints + 2);
     // The context is shared by every conversation the server keeps (the main one, side requests,
     // subagents), so the window announced to the client leaves some of it free.

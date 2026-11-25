@@ -37,6 +37,7 @@ class ReplyParser {
     enum class Sub { Name, Args, Value, Tail };
     void step(std::vector<ReplyEvent> &out, bool final);
     bool step_tool(std::vector<ReplyEvent> &out, bool final);
+    void step_inkling(std::vector<ReplyEvent> &out, bool final);
     void emit_text(State st, std::string_view text, std::vector<ReplyEvent> &out);
     void close_block(std::vector<ReplyEvent> &out);
     void start_tool(const std::string &name, std::vector<ReplyEvent> &out);
@@ -45,6 +46,9 @@ class ReplyParser {
     Json typed_value(const std::string &name, std::string_view raw) const;
 
     bool xml_;
+    bool inkling_ = false;       // Inkling's typed messages instead of ChatML text with tags
+    enum class Msg { Outside, Header, Thinking, Text, Tool } msg_ = Msg::Outside;
+    std::string msg_name_;       // what follows <|message_model|>: the tool's name, for a call
     const Json tools_;
     std::vector<std::string> stops_;
     State state_, resume_ = State::Content;   // resume_: where to continue if a tool-call marker turns out not to start a call

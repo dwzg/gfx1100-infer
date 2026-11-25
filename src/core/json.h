@@ -55,6 +55,7 @@ class Json {
     // spaced: ", " and ": " separators, as Python's json.dumps writes (chat templates embed
     // tool definitions that way). Otherwise compact.
     std::string dump(bool spaced = false) const;
+    std::string dump_sorted() const;   // compact, members of every object in order of their names
     void dump_to(std::string &out, bool spaced) const;
 
   private:

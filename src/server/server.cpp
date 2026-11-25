@@ -215,7 +215,9 @@ size_t common_prefix(const std::vector<int32_t> &a, const std::vector<int32_t> &
 
 class Service {
   public:
-    Service(GpuModel &model, const Tokenizer &tok, const ChatTemplate &tmpl, const ServerOptions &opt) : tok_(tok), tmpl_(tmpl), opt_(opt), cache_(model, opt.cache) {}
+    Service(GpuModel &model, const Tokenizer &tok, const ChatTemplate &tmpl, const ServerOptions &opt) : tok_(tok), tmpl_(tmpl), opt_(opt), cache_(model, opt.cache) {
+        if (!tmpl.body_end.empty()) body_end_ids_ = tok.encode(tmpl.body_end, false, true);
+    }
 
     void handle(Conn &c, const HttpRequest &req) {
         const bool head = req.method == "HEAD";
@@ -302,6 +304,7 @@ class Service {
                 b.marks.push_back((int)ids.size());
             }
             b.ids.insert(b.ids.end(), ids.begin(), ids.end());
+            if (i < b.prompt.mark_pieces) b.marks.push_back((int)b.ids.size());
         }
         b.prefix = encode(b.prompt.reply_prefix);
         b.ids.insert(b.ids.end(), b.prefix.begin(), b.prefix.end());
@@ -433,6 +436,7 @@ class Service {
             deliver();
             if (complete && parser.has_tool_call()) stop_reason = "tool_use";
             blocks = parser.blocks();
+            if (complete) raw.insert(raw.end(), body_end_ids_.begin(), body_end_ids_.end());   // part of the message as it is sent back
             if (!cancelled) remember(blocks, std::move(raw));
         } catch (const ContextFull &e) {
             if (!stream) throw;
@@ -478,6 +482,7 @@ class Service {
     size_t token_cache_bytes_ = 0;
     std::unordered_map<std::string, std::vector<int32_t>> generated_;   // reply body text -> the tokens it was generated as
     std::deque<std::string> generated_order_;
+    std::vector<int32_t> body_end_ids_;
 };
 
 void serve_connection(Service &svc, int fd) {

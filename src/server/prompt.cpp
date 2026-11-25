@@ -1,5 +1,6 @@
 #include "prompt.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "core/gguf.h"
@@ -106,6 +107,10 @@ Parts split_assistant(const Json &content) {
 
 ChatTemplate ChatTemplate::from_text(const std::string &jinja) {
     ChatTemplate t;
+    if (jinja.find("<|message_user|>") != std::string::npos && jinja.find("<|content_text|>") != std::string::npos && jinja.find("<|end_message|>") != std::string::npos) {
+        t.supported = true; t.family = Family::Inkling; t.reasoning = true; t.body_end = "<|content_model_end_sampling|>";
+        return t;
+    }
     if (jinja.find("<|im_start|>") == std::string::npos) { t.problem = "only ChatML-style chat templates (<|im_start|>role ... <|im_end|>) are supported"; return t; }
     t.supported = true;
     t.trim = jinja.find("|trim") != std::string::npos || jinja.find("| trim") != std::string::npos;
@@ -149,6 +154,7 @@ ChatTemplate ChatTemplate::detect(const GGUF &g) {
 
 std::string ChatTemplate::describe() const {
     if (!supported) return "unsupported (" + problem + ")";
+    if (family == Family::Inkling) return "Inkling messages, tool calls as JSON, reasoning with effort levels";
     std::string d = "ChatML, tool calls as ";
     d += tool_style == ToolStyle::Xml ? "<function=...> blocks" : "JSON";
     d += reasoning ? ", reasoning" : ", no reasoning";
@@ -162,9 +168,28 @@ std::string Prompt::text() const {
     return out + reply_prefix.s;
 }
 
+// One tool call in Inkling's notation: {"name":NAME,"args":{...}} with the arguments in order of their names.
+static std::string inkling_call(const std::string &name, const Json &input) {
+    std::string out = "{\"name\":";
+    json_quote(out, name);
+    out += ",\"args\":{";
+    std::vector<const Json::Member *> args;
+    for (const Json::Member &a : input.members()) args.push_back(&a);
+    std::sort(args.begin(), args.end(), [](const Json::Member *x, const Json::Member *y) { return x->first < y->first; });
+    for (size_t i = 0; i < args.size(); i++) { if (i) out += ','; json_quote(out, args[i]->first); out += ':'; args[i]->second.dump_to(out, false); }
+    return out + "}}";
+}
+
 MarkedText render_assistant_body(const ChatTemplate &t, const Json &content, bool with_reasoning) {
     Parts p = split_assistant(content);
     MarkedText m;
+    if (t.family == ChatTemplate::Family::Inkling) {
+        if (!p.reasoning.empty()) m.markup("<|message_model|><|content_thinking|>").quote(p.reasoning).markup("<|end_message|>");
+        if (!p.text.empty() || (p.calls.empty() && p.reasoning.empty())) m.markup("<|message_model|><|content_text|>").quote(p.text).markup("<|end_message|>");
+        for (const Json *call : p.calls)
+            m.markup("<|message_model|>").quote((*call)["name"].str()).markup("<|content_invoke_tool_json|>").quote(inkling_call((*call)["name"].str(), (*call)["input"])).markup("<|end_message|>");
+        return m.markup(t.body_end);
+    }
     with_reasoning &= t.reasoning;
     if (t.tool_style == ChatTemplate::ToolStyle::Xml) {
         const std::string_view text = strip(p.text);
@@ -195,8 +220,85 @@ MarkedText render_assistant_body(const ChatTemplate &t, const Json &content, boo
     return m;
 }
 
+// Inkling's format: a tool declaration, then typed messages. A system note sets the thinking
+// effort before the first message that is not a system message; the model opens its reply itself.
+static Prompt render_inkling(const ChatTemplate &t, const Json &req, const RenderOptions &o) {
+    const Json &messages = req["messages"];
+    Prompt out;
+    const std::string &choice = req["tool_choice"]["type"].str();
+    Json specs = Json::array();
+    if (choice != "none")
+        for (const Json &tool : req["tools"].items()) {
+            if (!tool["input_schema"].is_object() || tool["name"].str().empty() || tool["defer_loading"].boolean(false)) continue;
+            specs.push(Json::object().set("description", tool["description"].is_string() ? tool["description"] : Json("")).set("name", tool["name"]).set("parameters", tool["input_schema"]).set("type", "function"));
+        }
+    const bool have_tools = !specs.items().empty();
+    if (have_tools) out.pieces.push_back({MarkedText().markup("<|message_system|>tool_declare<|content_xml|>").quote(specs.dump_sorted()).markup("<|end_message|>"), false});
+    std::string sys;
+    const Json &system = req["system"];
+    if (system.is_string()) sys = system.str();
+    else for (const Json &b : system.items()) {
+        const std::string &text = b["text"].str();
+        if (b["type"].str() != "text" || text.empty() || text.compare(0, 27, "x-anthropic-billing-header:") == 0) continue;
+        if (!sys.empty()) sys += "\n\n";
+        sys += text;
+    }
+    if (!sys.empty()) out.pieces.push_back({MarkedText().markup("<|message_system|><|content_text|>").quote(sys).markup("<|end_message|>"), false});
+    out.mark_pieces = out.pieces.size();
+    const bool forced = have_tools && (choice == "any" || choice == "tool");
+    const char *level = !o.thinking || forced ? "0" : o.effort == "low" ? "0.2" : o.effort == "medium" ? "0.7" : "0.9";
+    const MarkedText effort = MarkedText().markup("<|message_system|><|content_text|>Thinking effort level: ").markup(level).markup("<|end_message|>");
+    bool effort_done = false;
+
+    // The name of the tool each result belongs to.
+    auto tool_name = [&](const std::string &id) -> std::string {
+        for (const Json &m : messages.items())
+            if (m["role"].str() == "assistant") for (const Json &b : m["content"].items()) if (b["type"].str() == "tool_use" && b["id"].str() == id) return b["name"].str();
+        return {};
+    };
+    const size_t n = messages.items().size();
+    const bool prefill = messages.items()[n - 1]["role"].str() == "assistant";
+    for (size_t i = 0; i < n; i++) {
+        const Json &msg = messages.items()[i];
+        const std::string &role = msg["role"].str();
+        const Json &content = msg["content"];
+        if (role != "system" && !effort_done) { out.pieces.push_back({effort, false}); effort_done = true; }
+        if (role == "assistant") {
+            if (i == n - 1) break;
+            out.pieces.push_back({render_assistant_body(t, content, true), true});
+        } else if (role == "user" || role == "system") {
+            const char *open = role == "user" ? "<|message_user|><|content_text|>" : "<|message_system|><|content_text|>";
+            if (content.is_string()) { out.pieces.push_back({MarkedText().markup(open).quote(content.str()).markup("<|end_message|>"), false}); continue; }
+            for (const Json &b : content.items()) {
+                const std::string &type = b["type"].str();
+                if (type == "tool_result")
+                    out.pieces.push_back({MarkedText().markup("<|message_tool|>").quote(tool_name(b["tool_use_id"].str())).markup("<|content_text|>").quote(result_text(b["content"], req["tools"])).markup("<|end_message|>"), false});
+                else if (type == "text" || type == "image" || type == "document")
+                    out.pieces.push_back({MarkedText().markup(open).quote(type == "text" ? b["text"].str() : type == "image" ? "[image]" : "[document]").markup("<|end_message|>"), false});
+            }
+        } else throw std::runtime_error("messages." + std::to_string(i) + ".role: expected \"user\" or \"assistant\"");
+    }
+    if (!effort_done) out.pieces.push_back({effort, false});
+    if (prefill) {
+        Parts p = split_assistant(messages.items()[n - 1]["content"]);
+        out.reply_prefix.markup("<|message_model|><|content_text|>").quote(p.text);
+        out.fed_to_parser = "<|message_model|><|content_text|>";
+    } else if (forced) {
+        const std::string &name = req["tool_choice"]["name"].str();
+        if (choice == "tool" && !name.empty()) {
+            std::string head = "<|message_model|>" + name + "<|content_invoke_tool_json|>{\"name\":";
+            json_quote(head, name);
+            head += ",\"args\":";
+            out.reply_prefix.markup(head); out.fed_to_parser = head;
+        } else { out.reply_prefix.markup("<|message_model|>"); out.fed_to_parser = "<|message_model|>"; }
+    }
+    return out;
+}
+
 Prompt render_prompt(const ChatTemplate &t, const Json &req, const RenderOptions &o) {
     if (!t.supported) throw std::runtime_error("chat template not supported: " + t.problem);
+    if (!req["messages"].is_array() || req["messages"].items().empty()) throw std::runtime_error("messages: at least one message is required");
+    if (t.family == ChatTemplate::Family::Inkling) return render_inkling(t, req, o);
     const Json &messages = req["messages"];
     if (!messages.is_array() || messages.items().empty()) throw std::runtime_error("messages: at least one message is required");
     const bool xml = t.tool_style == ChatTemplate::ToolStyle::Xml;

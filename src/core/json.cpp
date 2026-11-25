@@ -1,5 +1,6 @@
 #include "json.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -209,6 +210,22 @@ void Json::dump_to(std::string &out, bool spaced) const {
             break;
     }
 }
+
+static void dump_sorted_to(const Json &j, std::string &out) {
+    if (j.is_array()) {
+        out += '[';
+        for (size_t i = 0; i < j.items().size(); i++) { if (i) out += ','; dump_sorted_to(j.items()[i], out); }
+        out += ']';
+    } else if (j.is_object()) {
+        std::vector<const Json::Member *> m;
+        for (const Json::Member &x : j.members()) m.push_back(&x);
+        std::sort(m.begin(), m.end(), [](const Json::Member *a, const Json::Member *b) { return a->first < b->first; });
+        out += '{';
+        for (size_t i = 0; i < m.size(); i++) { if (i) out += ','; json_quote(out, m[i]->first); out += ':'; dump_sorted_to(m[i]->second, out); }
+        out += '}';
+    } else j.dump_to(out, false);
+}
+std::string Json::dump_sorted() const { std::string o; dump_sorted_to(*this, o); return o; }
 
 std::string Json::dump(bool spaced) const { std::string o; dump_to(o, spaced); return o; }
 

@@ -5,7 +5,7 @@ Each reply is fed to the parser in pieces of several sizes (down to single bytes
 multi-byte characters get split everywhere) and must always produce the same blocks, a stream of
 events that adds up to those blocks, and - parsed and written back - the text it started as.
 
-    tests/test_reply.py <gfxi> <model with <function=...> tool calls> [<model with JSON tool calls>]
+    tests/test_reply.py <gfxi> <model with <function=...> tool calls> [<model with JSON tool calls> [<Inkling model>]]
 """
 import json, os, subprocess, sys, tempfile
 
@@ -42,6 +42,18 @@ JSON_STYLE = [
      [('thinking', 'hmm'), ('text', 'OK.'), ('tool_use', ('Read', {'file_path': '/x', 'limit': 3}))], None),
     ('not a call after all', 'See <tool_call>this</tool_call> tag', [], [('text', 'See <tool_call>this</tool_call> tag')], None),
 ]
+INK_CALL = '<|message_model|>Read<|content_invoke_tool_json|>{"name":"Read","args":{"file_path":"/src/main.cpp","limit":40}}<|end_message|>'
+INKLING = [
+    ('reasoning, text, call', '<|message_model|><|content_thinking|>Let me think.<|end_message|><|message_model|><|content_text|>I will read it.<|end_message|>' + INK_CALL, [],
+     [('thinking', 'Let me think.'), ('text', 'I will read it.'), ('tool_use', ('Read', {'file_path': '/src/main.cpp', 'limit': 40}))], '{}<|content_model_end_sampling|>'),
+    ('answer only', '<|message_model|><|content_text|>Plain answer — with “quotes” and 你好.<|end_message|>', [], [('text', 'Plain answer — with “quotes” and 你好.')], '{}<|content_model_end_sampling|>'),
+    ('two calls', INK_CALL + '<|message_model|>Edit<|content_invoke_tool_json|>{"name":"Edit","args":{"edits":[{"old":"x","new":"y"}],"file_path":"/a b.c","new_string":"int x;\\n","replace_all":true}}<|end_message|>', [],
+     [('tool_use', ('Read', {'file_path': '/src/main.cpp', 'limit': 40})),
+      ('tool_use', ('Edit', {'edits': [{'old': 'x', 'new': 'y'}], 'file_path': '/a b.c', 'new_string': 'int x;\n', 'replace_all': True}))], '{}<|content_model_end_sampling|>'),
+    ('cut off inside the text', '<|message_model|><|content_thinking|>Hm.<|end_message|><|message_model|><|content_text|>The answer is', ['--cut'], [('thinking', 'Hm.'), ('text', 'The answer is')], False),
+    ('cut off inside a call', '<|message_model|><|content_text|>Go.<|end_message|><|message_model|>Read<|content_invoke_tool_json|>{"name":"Read","args":{"file_pa', ['--cut'],
+     [('text', 'Go.'), ('text', '{"name":"Read","args":{"file_pa')], False),
+]
 
 
 def run(gfxi, model, req, text, flags, chunk):
@@ -53,7 +65,7 @@ def run(gfxi, model, req, text, flags, chunk):
     return json.loads(out.stdout.decode('utf-8'))
 
 
-def check(gfxi, model, cases):
+def check(gfxi, model, cases, opening=''):
     failed = 0
     for name, text, flags, want, back in cases:
         for chunk in (1, 2, 3, 7, 64, 100000):
@@ -86,7 +98,7 @@ def check(gfxi, model, cases):
                 print(f'FAIL {name} (pieces of {chunk}): ' + '; '.join(problems))
                 break
     # Stop sequences end the text.
-    r = run(gfxi, model, {'tools': TOOLS, 'stop_sequences': ['###', 'END']}, 'one two ##three END four', [], 2)
+    r = run(gfxi, model, {'tools': TOOLS, 'stop_sequences': ['###', 'END']}, opening + 'one two ##three END four', [], 2)
     if not r['stopped'] or r['blocks'] != [{'type': 'text', 'text': 'one two ##three'}]: failed += 1; print('FAIL stop sequence:', r['blocks'])
     return failed, len(cases) + 1
 
@@ -96,6 +108,8 @@ def main():
     failed, total = check(gfxi, sys.argv[2], XML)
     if len(sys.argv) > 3:
         f, t = check(gfxi, sys.argv[3], JSON_STYLE); failed += f; total += t
+    if len(sys.argv) > 4:
+        f, t = check(gfxi, sys.argv[4], INKLING, '<|message_model|><|content_text|>'); failed += f; total += t
     print(f'{total - failed}/{total} reply cases passed')
     sys.exit(1 if failed else 0)
 
