@@ -389,6 +389,48 @@ static int cmd_compare(int argc, char **argv) {
         else throw std::runtime_error("unknown option " + a);
     }
     GGUF g; g.open(argv[0]);
+    if (is_inkling(g)) {
+        // The reference runs first: it also tells which experts the test needs on the device, so
+        // that a machine without room for all of them (they stay unwritten) can run the test.
+        InklingDesc idesc = describe_inkling(g);
+        Tokenizer tok(g);
+        std::vector<int32_t> ids = tok.encode(prompt, false, true);
+        const int n_ctx = skip + (int)ids.size() + n_extra + 1;
+        InklingRef ref(g, idesc, n_ctx, (int)std::thread::hardware_concurrency());
+        if (skip > 0) ref.skip_to(skip);
+        std::vector<std::vector<float>> want;
+        std::vector<int32_t> extra;
+        std::vector<std::vector<bool>> used(idesc.n_layer, std::vector<bool>(idesc.n_expert, false));
+        auto note = [&] { for (int sl = 0; sl < idesc.n_slots(); sl++) for (int e : ref.last_experts()[sl]) used[idesc.slot_layer(sl)][e] = true; };
+        for (size_t i = 0; i < ids.size(); i++) { const std::vector<float> &l = ref.eval(&ids[i], 1); note(); if (i + 1 == ids.size()) want.push_back(l); }
+        for (int i = 0; i < n_extra; i++) {
+            int32_t t = (int32_t)(std::max_element(want.back().begin(), want.back().end()) - want.back().begin());
+            extra.push_back(t);
+            want.push_back(ref.eval(&t, 1)); note();
+        }
+        size_t n_used = 0;
+        for (auto &l : used) for (bool b : l) n_used += b;
+        Device dev(device);
+        printf("reference done; %zu of %d expert slots are needed on the device\n", n_used, idesc.n_layer * idesc.n_expert);
+        GpuModel gpu(dev, g, idesc, n_ctx, kv8, 256ull << 20, batch, true, [&](int layer, int e) { return used[layer][e]; });
+        if (skip > 0) gpu.skip_to(skip);
+        printf("device %s, model %s, weights on device %.2f GiB (allocated), %s cache, %zu prompt tokens + %d generated from position %d, %zu dispatches per token\n", dev.caps().name.c_str(),
+               idesc.name.c_str(), gpu.weight_bytes() / 1073741824.0, kv8 ? "8-bit" : "half-precision", ids.size(), n_extra, skip, gpu.dispatches_per_token());
+        double worst = 0; int mismatches = 0;
+        for (size_t step = 0; step < want.size(); step++) {
+            const std::vector<float> &lg = step == 0 ? gpu.eval(ids.data(), (int)ids.size()) : gpu.eval(&extra[step - 1], 1);
+            const std::vector<float> &r = want[step];
+            double num = 0, den = 0, maxd = 0;
+            for (size_t i = 0; i < r.size(); i++) { double d = (double)lg[i] - r[i]; num += d * d; den += (double)r[i] * r[i]; maxd = std::max(maxd, std::fabs(d)); }
+            int32_t ar = (int32_t)(std::max_element(r.begin(), r.end()) - r.begin()), ag = (int32_t)(std::max_element(lg.begin(), lg.end()) - lg.begin());
+            double rel = std::sqrt(num / std::max(den, 1e-30));
+            printf("  step %2zu: relative error %.2e, max abs diff %.4f, top token %s (%s)\n", step, rel, maxd, ar == ag ? "same" : "DIFFERENT", tok.piece(ar).c_str());
+            worst = std::max(worst, rel); mismatches += ar != ag;
+        }
+        bool ok = worst <= tol && mismatches == 0;
+        printf("%s: worst relative error %.2e (tolerance %.2e), %d top-token mismatches in %zu steps\n", ok ? "PASS" : "FAIL", worst, tol, mismatches, want.size());
+        return ok ? 0 : 1;
+    }
     ModelDesc desc = describe_model(g);
     Tokenizer tok(g);
     std::vector<int32_t> ids = tok.encode(prompt, true, true);

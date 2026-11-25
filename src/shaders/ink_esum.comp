@@ -1,0 +1,19 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Weighted sum of the chosen experts' outputs (Inkling): y[t] = sum_k wts[t][k] * d[t][k].
+// With ADD (flag 1): y = a + b instead, element by element (used for residuals).
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer BD { float d[]; };       // [token][used][n]   (or a)
+layout(binding = 1) readonly buffer BW { float wts[]; };     // [token][used]      (or b)
+layout(binding = 2) writeonly buffer BY { float y[]; };      // [token][n]
+layout(push_constant) uniform PC { uint n; uint used; uint flags; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if ((pc.flags & 1u) != 0u) { if (i < pc.n) y[i] = d[i] + wts[i]; return; }
+    uint t = gl_WorkGroupID.y;
+    if (i >= pc.n) return;
+    float v = 0.0;
+    for (uint k = 0u; k < pc.used; k++) v += wts[t * pc.used + k] * d[(t * pc.used + k) * pc.n + i];
+    y[t * pc.n + i] = v;
+}

@@ -99,6 +99,9 @@ Device::Device(const std::string &select_in) {
     caps_.subgroup_size_control = f13.subgroupSizeControl && (p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
     caps_.max_alloc = p11.maxMemoryAllocationSize; caps_.max_buffer = p13.maxBufferSize;
     caps_.max_storage_range = props.limits.maxStorageBufferRange; caps_.storage_align = props.limits.minStorageBufferOffsetAlignment;
+    // Testing aid: Mesa's CPU driver reports a 128 MiB limit but works beyond it, and some tests
+    // need buffers that only a real GPU's limit allows.
+    if (const char *e = getenv("GFX_MAX_BINDING_MIB")) caps_.max_storage_range = strtoull(e, nullptr, 10) << 20;
     caps_.fp16 = f12.shaderFloat16; caps_.int8 = f12.shaderInt8; caps_.int16 = f2.features.shaderInt16;
     caps_.storage8 = f12.storageBuffer8BitAccess; caps_.storage16 = f11.storageBuffer16BitAccess;
     caps_.int_dot = f13.shaderIntegerDotProduct; caps_.int_dot_4x8_mixed_accel = p13.integerDotProduct4x8BitPackedMixedSignednessAccelerated;

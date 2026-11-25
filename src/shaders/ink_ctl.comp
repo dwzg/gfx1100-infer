@@ -1,0 +1,38 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Message controllers of looped layers (Inkling). Two steps around three small matrix products:
+//   default: c[t] = [cur / rms(cur), msg / rms(msg)]            (one workgroup per token)
+//   OUT:     out = cur - tanh(forget) * cur + tanh(gain) * msg  (one lane per element)
+#include "common.glsl"
+layout(binding = 0) readonly buffer BC { float cur[]; };
+layout(binding = 1) readonly buffer BM { float msg[]; };
+#ifdef OUT
+layout(local_size_x = 64) in;
+layout(binding = 2) readonly buffer BG { float gain[]; };
+layout(binding = 3) readonly buffer BF { float forget[]; };
+layout(binding = 4) writeonly buffer BO { float o[]; };
+layout(push_constant) uniform PC { uint count; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    o[i] = cur[i] - tanh(forget[i]) * cur[i] + tanh(gain[i]) * msg[i];
+}
+#else
+layout(local_size_x = 256) in;
+layout(binding = 2) writeonly buffer BO { float o[]; };   // [token][2n]
+layout(push_constant) uniform PC { uint n; } pc;
+shared float red[2][256];
+void main() {
+    uint lid = gl_LocalInvocationID.x, base = gl_WorkGroupID.x * pc.n;
+    float a = 0.0, b = 0.0;
+    for (uint i = lid; i < pc.n; i += 256u) { float u = cur[base + i], v = msg[base + i]; a += u * u; b += v * v; }
+    red[0][lid] = a; red[1][lid] = b;
+    barrier();
+    for (uint h = 128u; h > 0u; h >>= 1u) {
+        if (lid < h) { red[0][lid] += red[0][lid + h]; red[1][lid] += red[1][lid + h]; }
+        barrier();
+    }
+    float ia = inversesqrt(red[0][0] / float(pc.n) + 1.0e-6), ib = inversesqrt(red[1][0] / float(pc.n) + 1.0e-6);
+    for (uint i = lid; i < pc.n; i += 256u) { o[2u * base + i] = cur[base + i] * ia; o[2u * base + pc.n + i] = msg[base + i] * ib; }
+}
+#endif

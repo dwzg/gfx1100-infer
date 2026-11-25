@@ -12,11 +12,11 @@ layout(binding = 3) readonly buffer BCTL { uint pos; } ctl;
 layout(binding = 4) writeonly buffer BMIX { float mix[]; };
 layout(binding = 5) writeonly buffer BMS { float mixs[]; };
 shared float sv[gl_WorkGroupSize.x];
-layout(push_constant) uniform PC { uint hd; uint nh; uint seg; uint flags; uint part_stride; uint tq0; } pc;
+layout(push_constant) uniform PC { uint hd; uint nh; uint seg; uint flags; uint part_stride; uint tq0; uint n_seg; } pc;   // n_seg: 0 = as many as the position needs
 
 void main() {
     uint h = gl_WorkGroupID.x, lq = gl_WorkGroupID.y, tq = pc.tq0 + lq, d = gl_LocalInvocationID.x;
-    uint n_seg = (ctl.pos + tq) / pc.seg + 1u, o = (tq * pc.nh + h) * pc.hd + d;
+    uint n_seg = pc.n_seg != 0u ? pc.n_seg : (ctl.pos + tq) / pc.seg + 1u, o = (tq * pc.nh + h) * pc.hd + d;
     float acc = 0.0;
     for (uint sg = 0u; sg < n_seg; sg++) acc += part[lq * pc.part_stride + (sg * pc.nh + h) * pc.hd + d];
     acc *= z[tq * pc.nh + h];

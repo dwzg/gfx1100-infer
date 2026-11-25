@@ -1,0 +1,25 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Expert routing (Inkling), one workgroup per token: probabilities are sigmoids of the router
+// logits; the `used` experts with the largest probability plus selection bias are chosen (lower
+// index first among equals); their probabilities, normalised to sum to `scale`, weight the experts.
+#include "common.glsl"
+layout(local_size_x = 1) in;
+layout(binding = 0) readonly buffer BL { float logits[]; };   // [token][n_expert]
+layout(binding = 1) readonly buffer BB { float bias[]; };
+layout(binding = 2) writeonly buffer BI { uint ids[]; };      // [token][used]
+layout(binding = 3) writeonly buffer BW { float wts[]; };     // [token][used]
+layout(push_constant) uniform PC { uint n_expert; uint used; float scale; uint flags; } pc;
+void main() {
+    uint t = gl_WorkGroupID.x;
+    float pick[256];
+    for (uint e = 0u; e < pc.n_expert; e++) pick[e] = sigmoid(logits[t * pc.n_expert + e]) + ((pc.flags & 1u) != 0u ? bias[e] : 0.0);
+    uint chosen[32]; float p[32]; float sum = 0.0;
+    for (uint k = 0u; k < pc.used; k++) {
+        uint best = 0u; float bv = -3.0e38;
+        for (uint e = 0u; e < pc.n_expert; e++) if (pick[e] > bv) { bv = pick[e]; best = e; }
+        pick[best] = -3.0e38;
+        chosen[k] = best; p[k] = sigmoid(logits[t * pc.n_expert + best]); sum += p[k];
+    }
+    for (uint k = 0u; k < pc.used; k++) { ids[t * pc.used + k] = chosen[k]; wts[t * pc.used + k] = p[k] / (sum + 1.0e-20) * pc.scale; }
+}

@@ -1,0 +1,70 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Inkling variant of attn_score: adds the position bias for the distance (from ink_table, which
+// already has the sink logit subtracted). RING: the cache is a ring that keeps a sliding window.
+// Attention scores of each query token (gl_WorkGroupID.z) against every cached position up to its own.
+// The key cache is plane-major, [kv head][plane][position], so this has the same shape as the
+// quantised matvec: one lane per cached position, adjacent lanes read adjacent words, and the
+// query is the same for all lanes. The G query heads that share a key head are scored together,
+// so the cache is read once.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint G = 1u;       // query heads per key head
+layout(binding = 0) readonly buffer BQ { float q[]; };
+layout(binding = 1) readonly buffer BKC { uint kc[]; };
+layout(binding = 2) readonly buffer BCTL { uint pos; } ctl;
+layout(binding = 3) writeonly buffer BSC { float sc[]; };   // [query head][n_ctx]
+layout(binding = 4) readonly buffer BPT { uint pt[]; };     // page of the cache for each page of positions
+layout(binding = 5) readonly buffer BT { float table[]; };   // [token][query head][extent + 1]
+layout(push_constant) uniform PC { uint hd; uint stride; uint n_ctx; float scale; uint nh; uint tq0; uint page_shift; uint extent; uint ring; uint window; uint n_batch; } pc;
+
+void main() {
+    // Queries are scored in sub-batches: tq0 is the first query token of this one.
+    uint t = gl_GlobalInvocationID.x, kvh = gl_WorkGroupID.y, lq = gl_WorkGroupID.z, tq = pc.tq0 + lq, pq = ctl.pos + tq;
+#ifdef RING
+    // t: place in the ring. It holds the latest position written that is congruent to t.
+    if (t >= pc.ring) return;
+    uint last = ctl.pos + pc.n_batch - 1u;
+    uint p = t <= last ? last - ((last - t) % pc.ring) : 0u;
+    if (t > last || p > pq || pq - p >= pc.window) {
+        for (uint g = 0u; g < G; g++) sc[(lq * pc.nh + kvh * G + g) * pc.n_ctx + t] = -1.0e30;
+        return;
+    }
+    uint ct = t, dist = pq - p;
+#else
+    // t: position in the token stream; ct: where it is cached.
+    if (t > pq) return;
+    uint ct = (pt[t >> pc.page_shift] << pc.page_shift) | (t & ((1u << pc.page_shift) - 1u)), dist = pq - t;
+#endif
+    float s[G];
+    for (uint g = 0u; g < G; g++) s[g] = 0.0;
+    uint qb = (tq * pc.nh + kvh * G) * pc.hd;
+#ifdef KV8
+    // planes per head: hd/4 words of four signed bytes, then hd/64 words of two half-precision scales
+    uint base = kvh * (pc.hd / 4u + pc.hd / 64u);
+    for (uint blk = 0u; blk < pc.hd / 32u; blk++) {
+        float bs = unpackHalf2x16(kc[(base + pc.hd / 4u + (blk >> 1)) * pc.stride + ct])[blk & 1u];
+        float a[G];
+        for (uint g = 0u; g < G; g++) a[g] = 0.0;
+        for (uint k = 0u; k < 8u; k++) {
+            int wv = int(kc[(base + blk * 8u + k) * pc.stride + ct]);
+            uint d = blk * 32u + k * 4u;
+            float b0 = float(bitfieldExtract(wv, 0, 8)), b1 = float(bitfieldExtract(wv, 8, 8)), b2 = float(bitfieldExtract(wv, 16, 8)), b3 = float(wv >> 24);
+            for (uint g = 0u; g < G; g++) {
+                uint o = qb + g * pc.hd + d;
+                a[g] += b0 * q[o] + b1 * q[o + 1u] + b2 * q[o + 2u] + b3 * q[o + 3u];
+            }
+        }
+        for (uint g = 0u; g < G; g++) s[g] += a[g] * bs;
+    }
+#else
+    // planes per head: hd/2 words of two half-precision values
+    uint base = kvh * (pc.hd / 2u);
+    for (uint w = 0u; w < pc.hd / 2u; w++) {
+        vec2 kk = unpackHalf2x16(kc[(base + w) * pc.stride + ct]);
+        for (uint g = 0u; g < G; g++) { uint o = qb + g * pc.hd + 2u * w; s[g] += kk.x * q[o] + kk.y * q[o + 1u]; }
+    }
+#endif
+    uint e = min(dist, pc.extent);
+    for (uint g = 0u; g < G; g++) sc[(lq * pc.nh + kvh * G + g) * pc.n_ctx + t] = s[g] * pc.scale + table[(tq * pc.nh + kvh * G + g) * (pc.extent + 1u) + e];
+}

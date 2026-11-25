@@ -2,11 +2,13 @@
 // pre-recorded sequence of compute dispatches, one submission per token.
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "core/inkling.h"
 #include "core/model.h"
 #include "vk/vk.h"
 
@@ -21,6 +23,14 @@ class GpuModel {
     //      weights (capped at the model's trained context), keeping `reserve_bytes` unallocated.
     // batch: how many prompt tokens are processed together (1 disables batching).
     GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16 = false, bool kv8 = false, uint64_t reserve_bytes = 256ull << 20, int batch = 32, bool allow_wmma = true);
+    // Inkling 2 models. `want_expert`, a testing aid, limits which experts are uploaded (the rest
+    // of each layer's expert buffer is left unwritten), for machines that cannot hold them all.
+    using ExpertFilter = std::function<bool(int layer, int expert)>;
+    GpuModel(Device &dev, const GGUF &g, const InklingDesc &desc, int n_ctx, bool kv8 = false, uint64_t reserve_bytes = 256ull << 20, int batch = 32, bool allow_wmma = true,
+             const ExpertFilter &want_expert = {});
+    static uint64_t bytes_per_token(const InklingDesc &d, bool kv8);
+    // The experts the last token used, per cache slot (Inkling; for tests).
+    std::vector<std::vector<int>> last_experts();
     int batch() const { return batch_; }
     // Which weight formats passed the on-device check of the matrix-instruction kernels (empty if
     // the device has none, or they are disabled).
@@ -82,6 +92,10 @@ class GpuModel {
     size_t barriers_per_token() const;
 
   private:
+    static constexpr uint32_t k_tile = 4;                       // tokens per workgroup in the batched matrix kernels (T in the shaders)
+    static constexpr uint32_t k_wmma_tile = 16;                 // tokens per workgroup in the matrix-instruction kernels
+    static constexpr uint32_t k_wmma_min_tokens = 12;           // below this the portable batched kernels are used
+    static constexpr uint64_t k_scores_budget = 64ull << 20;    // bytes of score scratch (bounds how many queries are scored together)
     struct Matrix {
         uint32_t n_in = 0, n_out = 0;
         const struct PackFormat *fmt = nullptr;  // native quantised layout, or nullptr for fp16 rows
@@ -112,7 +126,13 @@ class GpuModel {
     void to_half(Program &p, const Vec &x, uint64_t n);
     void verify_wmma();
     void alloc_activations();
+    void init_batching(int batch, bool allow_wmma);
+    void init_context(uint64_t reserve_bytes, uint64_t fixed, int n_caches);
+    void finish_init();
     Program &program(int n_tokens);
+    struct Ink;                                    // everything specific to Inkling 2 models (gpu_inkling.cpp)
+    std::shared_ptr<Ink> ink_;
+    void record_inkling(Program &p, uint32_t N);
     void eval_batch(const int32_t *tokens, int n);
     struct Seq { bool live = false; int len = 0; std::vector<uint32_t> pages; };
     void take_pages(uint32_t pos0, uint32_t n);
@@ -142,9 +162,11 @@ class GpuModel {
     Buffer snap_, xfer_;                           // host copies: linear-attention state; transfers
     std::unique_ptr<Program> snap_save_, snap_load_;
     uint64_t recurrent_bytes_ = 0;
+    float ink_tau_alpha_ = 0, ink_tau_floor_ = 1, ink_softcap_ = 0;
     std::vector<std::pair<uint32_t, Buffer>> tables_;   // codebooks, by tensor type
     uint32_t stride_ = 0, kv_words_ = 0;   // cache plane stride (positions, padded) and words per head per position
-    std::vector<Buffer> zero_on_reset_;
+    std::vector<std::pair<Buffer, Buffer>> caches_;   // paged key / value caches, one pair per layer that attends to everything
+    std::vector<Buffer> state_bufs_;                  // everything else that depends on the tokens processed (cleared by reset)
     // Activations for up to batch_cap_ tokens (one vector per token, consecutive).
     struct Act { Buffer x, a, g, u, qfull, kraw, vraw, q, gate, scores, zsum, part, mixed, z, alpha, beta, qkv, dn_o, logits; Vec h, act, mix, dn_on, h_last; } act_;
     int batch_ = 1, batch_cap_ = 8, q_batch_ = 1;   // tokens per batch; allocated capacity; queries scored together

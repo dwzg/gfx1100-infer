@@ -1,0 +1,23 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// y[t][r] = dot(W[r], x[t]) for a small single-precision matrix stored row after row.
+// One lane per output row, one row of workgroups per token.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer BW { float w[]; };
+layout(binding = 1) readonly buffer BX { float x[]; };
+layout(binding = 2) writeonly buffer BY { float y[]; };
+layout(push_constant) uniform PC { uint n_in; uint n_rows; uint x_stride; uint y_stride; } pc;
+void main() {
+    uint r = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (r >= pc.n_rows) return;
+    uint wb = r * pc.n_in, xb = t * pc.x_stride;
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    uint i = 0u;
+    for (; i + 4u <= pc.n_in; i += 4u) {
+        a0 += w[wb + i] * x[xb + i]; a1 += w[wb + i + 1u] * x[xb + i + 1u];
+        a2 += w[wb + i + 2u] * x[xb + i + 2u]; a3 += w[wb + i + 3u] * x[xb + i + 3u];
+    }
+    for (; i < pc.n_in; i++) a0 += w[wb + i] * x[xb + i];
+    y[t * pc.y_stride + r] = (a0 + a1) + (a2 + a3);
+}

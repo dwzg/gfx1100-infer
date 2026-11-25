@@ -76,6 +76,8 @@ class InklingRef {
     void reset();
     int n_past() const { return n_past_; }
     int n_ctx() const { return n_ctx_; }
+    // Test aid: continue from position n as if n all-zero cache entries preceded it.
+    void skip_to(int n);
     const std::vector<float> &eval(const int32_t *tokens, int n);
     // The experts the last token used, per cache slot (for comparing against the GPU path).
     const std::vector<std::vector<int>> &last_experts() const { return experts_; }

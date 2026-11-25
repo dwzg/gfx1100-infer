@@ -1,0 +1,95 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Prepare tokens for attention (Inkling). One workgroup per (head, token), one lane per head
+// dimension; token k of the batch sits at position ctl.pos + k:
+//   query:    scale per element, limit the head's length to qk_clip, (full layers) times tau -> q
+//   key:      limit the head's length to qk_clip -> key cache
+//   value:    RMS-normalise the head -> value cache
+//   relative: scale per element, limit the length to rel_clip, (full layers) times tau -> r
+// The cache position is found through the page table, or (flag 2) is the position modulo the
+// size of a ring that only keeps a sliding window.
+#include "common.glsl"
+layout(local_size_x_id = 0) in;   // = head_dim
+layout(binding = 0) readonly buffer BQF { float qraw[]; };
+layout(binding = 1) readonly buffer BKR { float kraw[]; };
+layout(binding = 2) readonly buffer BVR { float vraw[]; };
+layout(binding = 3) readonly buffer BRR { float rraw[]; };
+layout(binding = 4) readonly buffer BQC { float qclip[]; };   // [head][hd]
+layout(binding = 5) readonly buffer BRC { float rclip[]; };   // [head][nr]
+layout(binding = 6) readonly buffer BCTL { uint pos; uint pad[3]; float tau[]; } ctl;   // tau: one per token, at [2 * token]
+layout(binding = 7) writeonly buffer BQ { float q[]; };
+layout(binding = 8) writeonly buffer BR { float r[]; };
+layout(binding = 9) writeonly buffer BKC { uint kc[]; };
+layout(binding = 10) writeonly buffer BVC { uint vc[]; };
+layout(binding = 11) readonly buffer BPT { uint pt[]; };
+#ifdef KV8
+shared int sq[gl_WorkGroupSize.x];
+#endif
+layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint nr; uint flags; float qk_clip; float rel_clip; float eps; uint stride; uint page_shift; uint ring; } pc;
+shared float sv[gl_WorkGroupSize.x];
+shared float red[gl_WorkGroupSize.x];
+
+// Sum of squares over the workgroup of each lane's v.
+float sumsq(float v) {
+    uint d = gl_LocalInvocationID.x;
+    red[d] = v * v;
+    barrier();
+    if (d == 0u) { float s = 0.0; for (uint i = 0u; i < pc.hd; i++) s += red[i]; red[0] = s; }
+    barrier();
+    float s = red[0];
+    barrier();
+    return s;
+}
+float clipped(float v, float limit) { return v * clamp(limit / (sqrt(sumsq(v)) + 1.0e-6), 0.0, 1.0); }
+
+#ifdef KV8
+// Quantise this lane's element with its 32-element block's scale. Returns the scale; the
+// quantised value is left in sq[] for all lanes.
+float quantise8(float v) {
+    uint d = gl_LocalInvocationID.x;
+    sv[d] = v;
+    barrier();
+    if ((d & 31u) == 0u) { float m = 0.0; for (uint i = 0u; i < 32u; i++) m = max(m, abs(sv[d + i])); red[d >> 5] = m; }
+    barrier();
+    float sc = float(float16_t(red[d >> 5] / 127.0));    // the scale as it will be stored
+    sq[d] = sc > 0.0 ? int(clamp(round(v / sc), -127.0, 127.0)) : 0;
+    barrier();
+    return sc;
+}
+float block_scale(uint b) { return float(float16_t(red[b] / 127.0)); }
+uint packed4(uint d) { return uint(sq[d] & 255) | (uint(sq[d + 1u] & 255) << 8) | (uint(sq[d + 2u] & 255) << 16) | (uint(sq[d + 3u]) << 24); }
+#endif
+
+
+void main() {
+    uint g = gl_WorkGroupID.x, d = gl_LocalInvocationID.x, tk = gl_WorkGroupID.y, lpos = ctl.pos + tk;
+    uint pos = (pc.flags & 2u) != 0u ? lpos % pc.ring : (pt[lpos >> pc.page_shift] << pc.page_shift) | (lpos & ((1u << pc.page_shift) - 1u));
+    bool has_q = g < pc.nh, has_kv = g < pc.nkv;
+    float tau = (pc.flags & 1u) != 0u ? ctl.tau[2u * tk] : 1.0;
+    float qv = clipped(has_q ? qraw[(tk * pc.nh + g) * pc.hd + d] * qclip[g * pc.hd + d] : 0.0, pc.qk_clip);
+    if (has_q) q[(tk * pc.nh + g) * pc.hd + d] = qv * tau;
+    float rv = clipped(has_q && d < pc.nr ? rraw[(tk * pc.nh + g) * pc.nr + d] * rclip[g * pc.nr + d] : 0.0, pc.rel_clip);
+    if (has_q && d < pc.nr) r[(tk * pc.nh + g) * pc.nr + d] = rv * tau;
+    uint kin = (tk * pc.nkv + g) * pc.hd + d;
+    float kv = clipped(has_kv ? kraw[kin] : 0.0, pc.qk_clip);
+    float vv = has_kv ? vraw[kin] : 0.0;
+    vv *= inversesqrt(sumsq(vv) / float(pc.hd) + pc.eps);
+#ifdef KV8
+    uint pk = pc.hd / 4u + pc.hd / 64u, vrow = pos * pc.nkv * pk + g * pk;
+    quantise8(kv);
+    if (has_kv && (d & 3u) == 0u) kc[(g * pk + (d >> 2)) * pc.stride + pos] = packed4(d);
+    if (has_kv && (d & 63u) == 0u) kc[(g * pk + pc.hd / 4u + (d >> 6)) * pc.stride + pos] = packHalf2x16(vec2(block_scale(d >> 5), block_scale((d >> 5) + 1u)));
+    barrier();
+    quantise8(vv);
+    if (has_kv && (d & 3u) == 0u) vc[vrow + (d >> 2)] = packed4(d);
+    if (has_kv && (d & 63u) == 0u) vc[vrow + pc.hd / 4u + (d >> 6)] = packHalf2x16(vec2(block_scale(d >> 5), block_scale((d >> 5) + 1u)));
+#else
+    uint pk = pc.hd / 2u;
+    sv[d] = kv; red[d] = vv;
+    barrier();
+    if (has_kv && (d & 1u) == 0u) {
+        kc[(g * pk + (d >> 1)) * pc.stride + pos] = packHalf2x16(vec2(sv[d], sv[d + 1u]));
+        vc[pos * pc.nkv * pk + g * pk + (d >> 1)] = packHalf2x16(vec2(red[d], red[d + 1u]));
+    }
+#endif
+}

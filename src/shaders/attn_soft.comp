@@ -11,7 +11,12 @@ layout(push_constant) uniform PC { uint n_ctx; uint nh; uint tq0; } pc;
 shared float red[256];
 
 void main() {
-    uint h = gl_WorkGroupID.x, lq = gl_WorkGroupID.y, tq = pc.tq0 + lq, lid = gl_LocalInvocationID.x, n_pos = ctl.pos + tq + 1u, sb = (lq * pc.nh + h) * pc.n_ctx;
+    uint h = gl_WorkGroupID.x, lq = gl_WorkGroupID.y, tq = pc.tq0 + lq, lid = gl_LocalInvocationID.x, sb = (lq * pc.nh + h) * pc.n_ctx;
+#ifdef RING
+    uint n_pos = pc.n_ctx;                 // every place of the ring (places outside the window score -inf)
+#else
+    uint n_pos = ctl.pos + tq + 1u;
+#endif
     float mx = -3.0e38;
     for (uint t = lid; t < n_pos; t += 256u) mx = max(mx, sc[sb + t]);
     red[lid] = mx;
@@ -19,10 +24,20 @@ void main() {
     if (lid == 0u) { float m = red[0]; for (uint i = 1u; i < 256u; i++) m = max(m, red[i]); red[0] = m; }
     barrier();
     mx = red[0];
+#ifdef SINK
+    mx = max(mx, 0.0);                     // a sink with logit zero takes part in the softmax
+#endif
     barrier();
     float sum = 0.0;
     for (uint t = lid; t < n_pos; t += 256u) { float e = exp(sc[sb + t] - mx); sc[sb + t] = e; sum += e; }
     red[lid] = sum;
     barrier();
-    if (lid == 0u) { float s = 0.0; for (uint i = 0u; i < 256u; i++) s += red[i]; z[tq * pc.nh + h] = 1.0 / s; }
+    if (lid == 0u) {
+        float s = 0.0;
+        for (uint i = 0u; i < 256u; i++) s += red[i];
+#ifdef SINK
+        s += exp(-mx);
+#endif
+        z[tq * pc.nh + h] = 1.0 / s;
+    }
 }

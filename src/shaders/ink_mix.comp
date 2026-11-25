@@ -1,0 +1,51 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Attention over the depth (Inkling): up to five residual streams of a token are normalised and
+// combined with softmax weights from a learned query. One workgroup per (query, token).
+//   out[q][t] = sum_s p_s * s_hat_s,   s_hat = s / rms(s),   p = softmax_s(s_hat_s . query_q / sqrt(n))
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer B0 { float s0[]; };
+layout(binding = 1) readonly buffer B1 { float s1[]; };
+layout(binding = 2) readonly buffer B2 { float s2[]; };
+layout(binding = 3) readonly buffer B3 { float s3[]; };
+layout(binding = 4) readonly buffer B4 { float s4[]; };
+layout(binding = 5) readonly buffer BQ { float query[]; };   // [query][n]
+layout(binding = 6) writeonly buffer BO { float o[]; };      // [query][token slot][n]
+layout(push_constant) uniform PC { uint n; uint n_states; uint out_stride; } pc;   // out_stride: elements per query in the output
+shared float red[10][256];
+shared float wgt[5];
+
+float state(uint s, uint i) { return s == 0u ? s0[i] : s == 1u ? s1[i] : s == 2u ? s2[i] : s == 3u ? s3[i] : s4[i]; }
+
+void main() {
+    uint lid = gl_LocalInvocationID.x, q = gl_WorkGroupID.x, t = gl_WorkGroupID.y, base = t * pc.n;
+    for (uint s = 0u; s < pc.n_states; s++) {
+        float ss = 0.0, dq = 0.0;
+        for (uint i = lid; i < pc.n; i += 256u) { float v = state(s, base + i); ss += v * v; dq += v * query[q * pc.n + i]; }
+        red[2u * s][lid] = ss; red[2u * s + 1u][lid] = dq;
+    }
+    barrier();
+    for (uint h = 128u; h > 0u; h >>= 1u) {
+        if (lid < h) for (uint k = 0u; k < 2u * pc.n_states; k++) red[k][lid] += red[k][lid + h];
+        barrier();
+    }
+    if (lid == 0u) {
+        float sc[5]; float mx = -3.0e38;
+        for (uint s = 0u; s < pc.n_states; s++) {
+            float inv = inversesqrt(red[2u * s][0] / float(pc.n) + 1.0e-6);
+            sc[s] = red[2u * s + 1u][0] * inv * inversesqrt(float(pc.n));
+            mx = max(mx, sc[s]);
+            wgt[s] = inv;
+        }
+        float sum = 0.0;
+        for (uint s = 0u; s < pc.n_states; s++) { sc[s] = exp(sc[s] - mx); sum += sc[s]; }
+        for (uint s = 0u; s < pc.n_states; s++) wgt[s] *= sc[s] / sum;   // weight times 1/rms
+    }
+    barrier();
+    for (uint i = lid; i < pc.n; i += 256u) {
+        float v = 0.0;
+        for (uint s = 0u; s < pc.n_states; s++) v += wgt[s] * state(s, base + i);
+        o[q * pc.out_stride + base + i] = v;
+    }
+}

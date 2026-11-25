@@ -176,6 +176,13 @@ void InklingRef::reset() {
     for (Vec &c : conv_) std::fill(c.begin(), c.end(), 0.0f);
 }
 
+void InklingRef::skip_to(int n) {
+    reset();
+    for (Vec &c : k_cache_) std::fill(c.begin(), c.end(), 0.0f);
+    for (Vec &c : v_cache_) std::fill(c.begin(), c.end(), 0.0f);
+    n_past_ = n;
+}
+
 const float *InklingRef::full(const TensorInfo *t) {
     auto it = decoded_.find(t);
     if (it != decoded_.end()) return it->second.data();

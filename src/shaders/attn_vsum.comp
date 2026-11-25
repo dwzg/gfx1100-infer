@@ -11,7 +11,9 @@ layout(binding = 0) readonly buffer BVC { uint vc[]; };
 layout(binding = 1) readonly buffer BSC { float sc[]; };    // exp(score - max), [query head][n_ctx]
 layout(binding = 2) readonly buffer BCTL { uint pos; } ctl;
 layout(binding = 3) writeonly buffer BP { float part[]; };  // [segment][query head][hd]
+#ifndef RING
 layout(binding = 4) readonly buffer BPT { uint pt[]; };     // page of the cache for each segment (a segment is one page)
+#endif
 layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint n_ctx; uint seg; uint part_stride; uint tq0; } pc;
 #ifdef KV8
 #define VPW 4u       // values per word
@@ -21,8 +23,13 @@ layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint n_ctx; uint 
 
 void main() {
     uint sg = gl_WorkGroupID.x, kvh = gl_WorkGroupID.y, lq = gl_WorkGroupID.z, tq = pc.tq0 + lq, w = gl_LocalInvocationID.x;
+#ifdef RING
+    // The cache is a ring of n_ctx places; weights of places outside the window are zero.
+    uint t0 = sg * pc.seg, t1 = min(pc.n_ctx, t0 + pc.seg), sb = (lq * pc.nh + kvh * G) * pc.n_ctx, c0 = 0u;
+#else
     uint t0 = sg * pc.seg, t1 = min(ctl.pos + tq + 1u, t0 + pc.seg), sb = (lq * pc.nh + kvh * G) * pc.n_ctx;
     uint c0 = pt[sg] * pc.seg - t0;   // cached row of position t is c0 + t (wraps, which is fine)
+#endif
     float acc[G * VPW];
     for (uint i = 0u; i < G * VPW; i++) acc[i] = 0.0;
 #ifdef KV8

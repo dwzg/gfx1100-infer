@@ -57,6 +57,17 @@ uint g_x0, g_s0;                   // offsets of the tile's first token in x and
 #define A(a) a[t]
 #define X(i) x[g_x0 + t * pc.x_stride + (i)]
 #define XS(i) xs[g_s0 + t * pc.xs_stride + (i)]
+#elif defined(EXPERT)
+// One of many matrices in the buffer (the experts of a mixture-of-experts layer), chosen per
+// (token, slot) pair by ids; the result is scaled by the expert's entry in `bias`.
+layout(binding = 6) readonly buffer BI { uint ids[]; };
+layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; uint used; uint x_stride; uint xs_stride; } pc;
+uint g_x0, g_s0;
+#define ACC float
+#define FOR_T
+#define A(a) a
+#define X(i) x[g_x0 + (i)]
+#define XS(i) xs[g_s0 + (i)]
 #else
 layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; } pc;
 #define ACC float
@@ -468,6 +479,18 @@ void main() {
     uint t0 = gl_WorkGroupID.y * T;
     g_x0 = t0 * pc.x_stride; g_s0 = t0 * pc.xs_stride;
 #endif
+#ifdef EXPERT
+    // flags bit 2: the input is per (token, slot) pair, otherwise per token.
+    uint pr = gl_WorkGroupID.z * pc.used + gl_WorkGroupID.y, id = ids[pr], src = (pc.flags & 2u) != 0u ? pr : gl_WorkGroupID.z;
+    g_x0 = src * pc.x_stride; g_s0 = src * pc.xs_stride;
+    uint ebase = id * pc.n_sb * NW * pc.stride;
+    for (uint s = 0u; s < pc.n_sb; s++) {
+        g_base = ebase + s * NW * pc.stride + row;
+        superblock(s * SB);
+    }
+    if (row < pc.n_rows) y[pr * pc.n_rows + row] = g_tot * bias[id];
+    return;
+#else
     for (uint s = 0u; s < pc.n_sb; s++) {
         g_base = s * NW * pc.stride + row;
         superblock(s * SB);
@@ -478,6 +501,7 @@ void main() {
     FOR_T if (t0 + t < pc.n_tokens) y[(t0 + t) * pc.y_stride + pc.row0 + row] = g_tot[t] + bv;
 #else
     y[pc.row0 + row] = g_tot + bv;
+#endif
 #endif
 }
 #endif

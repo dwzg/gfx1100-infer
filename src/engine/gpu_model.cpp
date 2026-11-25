@@ -22,13 +22,9 @@ struct PcMatmat { uint32_t n_in, n_rows, row0, flags, n_tokens, y_stride; };
 struct PcScore { uint32_t hd, stride, n_ctx; float scale; uint32_t nh, tq0, page_shift; };
 struct PcSoft { uint32_t n_ctx, nh, tq0; };
 struct PcVsum { uint32_t hd, nh, nkv, n_ctx, seg, part_stride, tq0; };
-struct PcCombine { uint32_t hd, nh, seg, flags, part_stride, tq0; };
+struct PcCombine { uint32_t hd, nh, seg, flags, part_stride, tq0, n_seg; };
 struct PcDnUpdate { uint32_t hk, s, n_tokens, hv_total, c_total; };
 struct PcDnHist { uint32_t c_total, hw, n_tokens; };
-constexpr uint32_t k_tile = 4;                       // tokens per workgroup in the batched matrix kernels (T in the shaders)
-constexpr uint32_t k_wmma_tile = 16;                 // tokens per workgroup in the matrix-instruction kernels
-constexpr uint32_t k_wmma_min_tokens = 12;           // below this the portable batched kernels are used
-constexpr uint64_t k_scores_budget = 64ull << 20;    // bytes of score scratch (bounds how many queries are scored together)
 constexpr uint32_t k_page = 1024;       // cached positions per page (also the segment of the value sum)
 struct PcDnPrep { uint32_t n_norm, kw; float eps; uint32_t c_total; };
 constexpr uint32_t k_ctl_header = 16;  // bytes before the rotation table
@@ -41,6 +37,48 @@ uint64_t GpuModel::bytes_per_token(const ModelDesc &d, bool kv8) {
 }
 
 GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16, bool kv8, uint64_t reserve_bytes, int batch, bool allow_wmma) : dev_(dev), g_(g), d_(desc), n_ctx_(n_ctx), force_fp16_(force_fp16), kv8_(kv8) {
+    init_batching(batch, allow_wmma);
+
+    layers_.resize(d_.n_layer);
+    for (int il = 0; il < d_.n_layer; il++) {
+        const LayerDesc &ld = d_.layers[il];
+        Layer &l = layers_[il];
+        l.recurrent = ld.recurrent;
+        l.attn_norm = load_vector(ld.attn_norm); l.ffn_norm = load_vector(ld.ffn_norm);
+        l.ffn_gate = load_matrix(ld.ffn_gate); l.ffn_up = load_matrix(ld.ffn_up); l.ffn_down = load_matrix(ld.ffn_down);
+        if (ld.recurrent) {
+            l.wqkv = load_matrix(ld.wqkv); l.wz = load_matrix(ld.wz); l.wbeta = load_matrix(ld.wbeta); l.walpha = load_matrix(ld.walpha);
+            l.ssm_out = load_matrix(ld.ssm_out);
+            l.conv_w = load_vector(ld.conv); l.dt = load_vector(ld.dt_bias); l.a = load_vector(ld.ssm_a); l.ssm_norm = load_vector(ld.ssm_norm);
+            l.state = dev_.alloc(4ull * d_.dn_v_heads * d_.dn_head_dim * d_.dn_head_dim);
+            l.hist = dev_.alloc(4ull * d_.dn_conv_dim() * (d_.dn_conv - 1));
+            state_bytes_ += l.state.size + l.hist.size;
+            state_bufs_.push_back(l.state); state_bufs_.push_back(l.hist);
+        } else {
+            l.wq = load_matrix(ld.wq, ld.bq); l.wk = load_matrix(ld.wk, ld.bk); l.wv = load_matrix(ld.wv, ld.bv); l.wo = load_matrix(ld.wo, ld.bo);
+            l.has_qk_norm = ld.q_norm && ld.k_norm;
+            if (l.has_qk_norm) {
+                std::vector<float> both(2 * (size_t)d_.head_dim);
+                dequantize(ld.q_norm->type, ld.q_norm->data, both.data(), d_.head_dim);
+                dequantize(ld.k_norm->type, ld.k_norm->data, both.data() + d_.head_dim, d_.head_dim);
+                l.qk_norm = dev_.alloc(both.size() * 4); dev_.upload(l.qk_norm, both.data(), both.size() * 4);
+            }
+        }
+    }
+    output_norm_ = load_vector(d_.output_norm);
+    output_ = load_matrix(d_.output);
+
+    const uint64_t fixed = 4ull * batch_cap_ * (4 * d_.n_embd + 4 * d_.n_ff + 8 * d_.n_head * d_.head_dim + 4 * d_.dn_conv_dim()) + 4ull * d_.n_vocab + 2 * k_scores_budget + (16ull << 20);
+    init_context(reserve_bytes, fixed, d_.n_attn_layers());
+    size_t ci = 0;
+    for (Layer &l : layers_) if (!l.recurrent) { l.kc = caches_[ci].first; l.vc = caches_[ci].second; ci++; }
+    alloc_activations();
+    if (wmma_) verify_wmma();
+    finish_init();
+}
+
+// Batch size, the matrix-instruction path, and the small host buffers every forward pass uses.
+void GpuModel::init_batching(int batch, bool allow_wmma) {
     // Batching addresses per-token vectors inside shared buffers, which needs aligned vector sizes.
     if (d_.n_embd % 16 || d_.n_ff % 16 || d_.head_dim % 16 || (d_.dn_head_dim % 16)) throw std::runtime_error("vector sizes that are not multiples of 16 are not supported");
     bool can_batch = d_.n_embd % 64 == 0 && d_.n_ff % 16 == 0 && (d_.n_head * d_.head_dim) % 16 == 0 && (d_.dn_v_heads * d_.dn_head_dim) % 16 == 0;
@@ -59,44 +97,17 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx,
     embd_ = dev_.alloc_host(4ull * d_.n_embd * batch_cap_);
     logits_host_ = dev_.alloc_host(4ull * d_.n_vocab);
     logits_.resize(d_.n_vocab);
+}
 
-    layers_.resize(d_.n_layer);
-    for (int il = 0; il < d_.n_layer; il++) {
-        const LayerDesc &ld = d_.layers[il];
-        Layer &l = layers_[il];
-        l.recurrent = ld.recurrent;
-        l.attn_norm = load_vector(ld.attn_norm); l.ffn_norm = load_vector(ld.ffn_norm);
-        l.ffn_gate = load_matrix(ld.ffn_gate); l.ffn_up = load_matrix(ld.ffn_up); l.ffn_down = load_matrix(ld.ffn_down);
-        if (ld.recurrent) {
-            l.wqkv = load_matrix(ld.wqkv); l.wz = load_matrix(ld.wz); l.wbeta = load_matrix(ld.wbeta); l.walpha = load_matrix(ld.walpha);
-            l.ssm_out = load_matrix(ld.ssm_out);
-            l.conv_w = load_vector(ld.conv); l.dt = load_vector(ld.dt_bias); l.a = load_vector(ld.ssm_a); l.ssm_norm = load_vector(ld.ssm_norm);
-            l.state = dev_.alloc(4ull * d_.dn_v_heads * d_.dn_head_dim * d_.dn_head_dim);
-            l.hist = dev_.alloc(4ull * d_.dn_conv_dim() * (d_.dn_conv - 1));
-            state_bytes_ += l.state.size + l.hist.size;
-            zero_on_reset_.push_back(l.state); zero_on_reset_.push_back(l.hist);
-        } else {
-            l.wq = load_matrix(ld.wq, ld.bq); l.wk = load_matrix(ld.wk, ld.bk); l.wv = load_matrix(ld.wv, ld.bv); l.wo = load_matrix(ld.wo, ld.bo);
-            l.has_qk_norm = ld.q_norm && ld.k_norm;
-            if (l.has_qk_norm) {
-                std::vector<float> both(2 * (size_t)d_.head_dim);
-                dequantize(ld.q_norm->type, ld.q_norm->data, both.data(), d_.head_dim);
-                dequantize(ld.k_norm->type, ld.k_norm->data, both.data() + d_.head_dim, d_.head_dim);
-                l.qk_norm = dev_.alloc(both.size() * 4); dev_.upload(l.qk_norm, both.data(), both.size() * 4);
-            }
-        }
-    }
-    output_norm_ = load_vector(d_.output_norm);
-    output_ = load_matrix(d_.output);
-
-    // Context size. With n_ctx <= 0, take what the free GPU memory allows.
+// Size the context (n_ctx_ <= 0: from the free GPU memory), set up the pages and allocate
+// `n_caches` paged key/value caches.
+void GpuModel::init_context(uint64_t reserve_bytes, uint64_t fixed, int n_caches) {
     const uint64_t per_pos_layer = 4ull * d_.n_head_kv * kv_words_;
     const uint64_t limit_ctx = dev_.caps().max_storage_range / std::max<uint64_t>(per_pos_layer, 4ull * d_.n_head) / 64 * 64;
     if (n_ctx_ <= 0) {
-        const uint64_t fixed = 4ull * batch_cap_ * (4 * d_.n_embd + 4 * d_.n_ff + 8 * d_.n_head * d_.head_dim + 4 * d_.dn_conv_dim()) + 4ull * d_.n_vocab + 2 * k_scores_budget + (16ull << 20);
         uint64_t freeb = dev_.vram_free();
         if (freeb <= reserve_bytes + fixed) throw std::runtime_error("no GPU memory left for context after loading the weights");
-        uint64_t fit = (freeb - reserve_bytes - fixed) / bytes_per_token(d_, kv8_);
+        uint64_t fit = (freeb - reserve_bytes - fixed) / std::max<uint64_t>(1, 2 * per_pos_layer * n_caches);
         if (d_.n_ctx_train > 0) fit = std::min<uint64_t>(fit, d_.n_ctx_train);
         n_ctx_ = (int)(std::min(fit, limit_ctx) / 64 * 64);
         if (n_ctx_ < 64) throw std::runtime_error("not enough GPU memory left for any context");
@@ -119,33 +130,29 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx,
     pt_ = dev_.alloc_host(4ull * n_pages);
     seqs_.resize(1); seqs_[0].live = true;
     write_page_table();
-    for (Layer &l : layers_) {
-        if (l.recurrent) continue;
+    for (int i = 0; i < n_caches; i++) {
         uint64_t kbytes = per_pos_layer * stride_, vbytes = per_pos_layer * (uint64_t)n_ctx_;
-        l.kc = dev_.alloc(kbytes); l.vc = dev_.alloc(vbytes);
+        caches_.emplace_back(dev_.alloc(kbytes), dev_.alloc(vbytes));
         state_bytes_ += kbytes + vbytes;
     }
-    alloc_activations();
-    if (wmma_) verify_wmma();
-    // Host copy of the linear-attention state, filled and read back with one submission each.
-    for (const Layer &l : layers_) if (l.recurrent) recurrent_bytes_ += l.state.size + l.hist.size;
+}
+
+// Host copy of the state outside the paged caches, filled and read back with one submission each.
+void GpuModel::finish_init() {
+    for (const Buffer &b : state_bufs_) recurrent_bytes_ += b.size;
     if (recurrent_bytes_) {
         snap_ = dev_.alloc_host(recurrent_bytes_);
         snap_save_ = std::make_unique<Program>(dev_); snap_load_ = std::make_unique<Program>(dev_);
         uint64_t off = 0;
-        for (const Layer &l : layers_) {
-            if (!l.recurrent) continue;
-            for (const Buffer *b : {&l.state, &l.hist}) {
-                snap_save_->copy(*b, snap_.sub(off, b->size)); snap_load_->copy(snap_.sub(off, b->size), *b);
-                off += b->size;
-            }
+        for (const Buffer &b : state_bufs_) {
+            snap_save_->copy(b, snap_.sub(off, b.size)); snap_load_->copy(snap_.sub(off, b.size), b);
+            off += b.size;
         }
         snap_save_->finish(); snap_load_->finish();
     }
     reset();
     program(1);
 }
-GpuModel::~GpuModel() = default;
 
 void GpuModel::reset() {
     seq_truncate(0);
@@ -153,13 +160,13 @@ void GpuModel::reset() {
 }
 
 void GpuModel::state_clear() {
-    for (const Buffer &b : zero_on_reset_) dev_.fill_zero(b);
+    for (const Buffer &b : state_bufs_) dev_.fill_zero(b);
     std::fill(logits_.begin(), logits_.end(), 0.0f);
 }
 
 void GpuModel::skip_to(int n) {
     reset();
-    for (Layer &l : layers_) if (!l.recurrent) { dev_.fill_zero(l.kc); dev_.fill_zero(l.vc); }
+    for (auto &c : caches_) { dev_.fill_zero(c.first); dev_.fill_zero(c.second); }
     if (n > 0) take_pages(0, (uint32_t)n);
     seqs_[active_].len = n;
 }
@@ -253,10 +260,9 @@ void GpuModel::copy_page(uint32_t from, uint32_t to) {
     const uint64_t planes = (uint64_t)d_.n_head_kv * kv_words_, pb = 4ull * page_;
     std::vector<VkBufferCopy> rk(planes);
     for (uint64_t pl = 0; pl < planes; pl++) rk[pl] = {(pl * stride_ + (uint64_t)from * page_) * 4, (pl * stride_ + (uint64_t)to * page_) * 4, pb};
-    for (const Layer &l : layers_) {
-        if (l.recurrent) continue;
-        p.copy_many(l.kc, l.kc, rk);
-        p.copy_many(l.vc, l.vc, {{from * pb * planes, to * pb * planes, pb * planes}});
+    for (const auto &c : caches_) {
+        p.copy_many(c.first, c.first, rk);
+        p.copy_many(c.second, c.second, {{from * pb * planes, to * pb * planes, pb * planes}});
     }
     p.run();
 }
@@ -534,6 +540,12 @@ void GpuModel::verify_wmma() {
 Program &GpuModel::program(int n_tokens) {
     auto &slot = programs_[n_tokens];
     if (slot) return *slot;
+    if (ink_) {
+        slot = std::make_unique<Program>(dev_);
+        record_inkling(*slot, (uint32_t)n_tokens);
+        slot->finish();
+        return *slot;
+    }
     const uint32_t N = (uint32_t)n_tokens;
     const int n = d_.n_embd, hd = d_.head_dim, nh = d_.n_head, nkv = d_.n_head_kv, qw = d_.q_has_gate ? 2 * hd : hd;
     const int S = d_.dn_head_dim, HK = d_.dn_k_heads, HV = d_.dn_v_heads, C = d_.dn_conv_dim();
@@ -589,7 +601,7 @@ Program &GpuModel::program(int n_tokens) {
                 p.dispatch(p_soft, {R(ctl_), W(a.scores), W(a.zsum)}, &pf, sizeof pf, nh, nb);
                 PcVsum pv{(uint32_t)hd, (uint32_t)nh, (uint32_t)nkv, stride_, page_, part_stride_, q0};
                 p.dispatch_indirect(p_vsum, {R(l.vc), R(a.scores), R(ctl_), W(a.part), R(pt_)}, &pv, sizeof pv, ind_.sub(32ull * sub + 16, 12));
-                PcCombine pcb{(uint32_t)hd, (uint32_t)nh, page_, d_.q_has_gate ? 1u : 0u, part_stride_, q0};
+                PcCombine pcb{(uint32_t)hd, (uint32_t)nh, page_, d_.q_has_gate ? 1u : 0u, part_stride_, q0, 0};
                 p.dispatch(p_combine, {R(a.part), R(a.zsum), R(a.gate), R(ctl_), W(a.mix.v), W(a.mix.s)}, &pcb, sizeof pcb, nh, nb);
             }
             if (halves) to_half(p, a.mix, n16 * nh * hd);
@@ -630,6 +642,8 @@ void GpuModel::eval_batch(const int32_t *tokens, int n) {
         if (tokens[t] < 0 || tokens[t] >= d_.n_vocab) throw std::runtime_error("token id out of range");
         if (!dequantize(d_.tok_embd->type, d_.tok_embd->data + (uint64_t)tokens[t] * row_bytes, (float *)embd_.mapped + (size_t)t * d_.n_embd, d_.n_embd))
             throw std::runtime_error("no decoder for the embedding table");
+        // Inkling has no rotation; its queries are scaled by a slowly growing function of the position.
+        if (ink_) rot[(size_t)t * 2] = 1.0f + ink_tau_alpha_ * std::log(std::max(1.0f, (float)(pos0 + t + 1) / ink_tau_floor_));
         // Rotation table for this token's position, computed in double precision.
         for (int i = 0; i < d_.rope_dim / 2; i++) {
             double theta = (double)(pos0 + t) * std::pow((double)d_.rope_base, -2.0 * i / d_.rope_dim);
@@ -656,6 +670,7 @@ const std::vector<float> &GpuModel::eval(const int32_t *tokens, int n) {
         done += take;
     }
     memcpy(logits_.data(), logits_host_.mapped, logits_.size() * 4);
+    if (ink_softcap_ != 0.0f) for (float &v : logits_) v = ink_softcap_ * std::tanh(v / ink_softcap_);
     return logits_;
 }
 
@@ -685,22 +700,18 @@ void GpuModel::save_state(const std::string &path, const std::vector<int32_t> &t
     const Seq &sq = seqs_[active_];
     StateHeader h{};
     memcpy(h.magic, k_state_magic, 8);
-    h.version = 1; h.kv8 = kv8_; h.n_layer = d_.n_layer; h.n_attn = d_.n_attn_layers(); h.head_dim = d_.head_dim; h.n_head_kv = d_.n_head_kv;
+    h.version = 2; h.kv8 = kv8_; h.n_layer = d_.n_layer; h.n_attn = d_.n_attn_layers(); h.head_dim = d_.head_dim; h.n_head_kv = d_.n_head_kv;
     h.kv_words = kv_words_; h.n_embd = d_.n_embd; h.n_vocab = d_.n_vocab; h.n_past = sq.len; h.n_tokens = (uint32_t)tokens.size(); h.model_bytes = g_.file_size;
     f.write(&h, sizeof h);
     f.write(tokens.data(), tokens.size() * 4);
     f.write(logits_.data(), logits_.size() * 4);
     std::vector<uint8_t> buf;
     const Regions kr = key_regions(sq, sq.len), vr = value_regions(sq, sq.len);
-    for (const Layer &l : layers_) {
-        if (l.recurrent) {
-            read_regions(l.state, {{0, l.state.size}}, buf); f.write(buf.data(), buf.size());
-            read_regions(l.hist, {{0, l.hist.size}}, buf); f.write(buf.data(), buf.size());
-            continue;
-        }
+    for (const Buffer &b : state_bufs_) { read_regions(b, {{0, b.size}}, buf); f.write(buf.data(), buf.size()); }
+    for (const auto &c : caches_) {
         // each key plane's filled positions, then the value rows, in sequence order
-        read_regions(l.kc, kr, buf); f.write(buf.data(), buf.size());
-        read_regions(l.vc, vr, buf); f.write(buf.data(), buf.size());
+        read_regions(c.first, kr, buf); f.write(buf.data(), buf.size());
+        read_regions(c.second, vr, buf); f.write(buf.data(), buf.size());
     }
 }
 
@@ -708,7 +719,7 @@ std::vector<int32_t> GpuModel::load_state(const std::string &path) {
     File f(path, "rb");
     StateHeader h;
     f.read(&h, sizeof h);
-    if (memcmp(h.magic, k_state_magic, 8) || h.version != 1) throw std::runtime_error(path + " is not a saved context");
+    if (memcmp(h.magic, k_state_magic, 8) || h.version != 2) throw std::runtime_error(path + " is not a saved context");
     if (h.model_bytes != g_.file_size || h.n_layer != (uint32_t)d_.n_layer || h.head_dim != (uint32_t)d_.head_dim || h.n_head_kv != (uint32_t)d_.n_head_kv ||
         h.n_embd != (uint32_t)d_.n_embd || h.n_vocab != (uint32_t)d_.n_vocab)
         throw std::runtime_error("the saved context was made with a different model");
@@ -727,10 +738,8 @@ std::vector<int32_t> GpuModel::load_state(const std::string &path) {
         buf.resize(total); f.read(buf.data(), total); write_regions(b, r, buf.data());
     };
     const Regions kr = key_regions(sq, (int)h.n_past), vr = value_regions(sq, (int)h.n_past);
-    for (const Layer &l : layers_) {
-        if (l.recurrent) { restore(l.state, {{0, l.state.size}}); restore(l.hist, {{0, l.hist.size}}); continue; }
-        restore(l.kc, kr); restore(l.vc, vr);
-    }
+    for (const Buffer &b : state_bufs_) restore(b, {{0, b.size}});
+    for (const auto &c : caches_) { restore(c.first, kr); restore(c.second, vr); }
     sq.len = (int)h.n_past;
     return tokens;
 }

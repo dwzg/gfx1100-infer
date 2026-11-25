@@ -1,0 +1,37 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Short causal convolution with a residual (Inkling), in place, one lane per channel:
+//   x[t] = (x[t] + sum_i w[i] * x[t - (nc-1) + i] (+ sum_lag taps[t][lag] * x[t - lag])) / sqrt((taps ? 2 : 1) * nc + 1)
+// on the values before the update. The last nc-1 inputs of each channel are kept in `hist`
+// between calls (oldest first). The tokens of a batch are walked in order.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(binding = 0) buffer BX { float x[]; };                 // [token][x_stride]
+layout(binding = 1) readonly buffer BW { float w[]; };        // [channel][nc]
+layout(binding = 2) buffer BH { float hist[]; };              // [channel][nc - 1], this convolution's part
+layout(binding = 3) readonly buffer BT { float taps[]; };     // [token][head][nc]
+layout(push_constant) uniform PC { uint n_ch; uint nc; uint n_tokens; uint x_stride; uint flags; uint per_head; uint taps_stride; } pc;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.n_ch) return;
+    float h[8];
+    uint nh = pc.nc - 1u;
+    for (uint i = 0u; i < nh; i++) h[i] = hist[c * nh + i];
+    bool dyn = (pc.flags & 1u) != 0u;
+    float norm = inversesqrt(float((dyn ? 2u : 1u) * pc.nc + 1u));
+    uint head = c / pc.per_head;
+    for (uint t = 0u; t < pc.n_tokens; t++) {
+        float cur = x[t * pc.x_stride + c];
+        float acc = cur * w[c * pc.nc + nh];
+        for (uint i = 0u; i < nh; i++) acc += h[i] * w[c * pc.nc + i];
+        if (dyn) {
+            uint tb = t * pc.taps_stride + head * pc.nc;
+            acc += cur * taps[tb];
+            for (uint lag = 1u; lag < pc.nc; lag++) acc += h[nh - lag] * taps[tb + lag];
+        }
+        for (uint i = 0u; i + 1u < nh; i++) h[i] = h[i + 1u];
+        h[nh - 1u] = cur;
+        x[t * pc.x_stride + c] = (cur + acc) * norm;
+    }
+    for (uint i = 0u; i < nh; i++) hist[c * nh + i] = h[i];
+}
