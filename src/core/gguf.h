@@ -12,7 +12,7 @@ namespace gfx {
 enum GType : uint32_t {
     T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q4_1 = 3, T_Q5_0 = 6, T_Q5_1 = 7, T_Q8_0 = 8,
     T_Q2_K = 10, T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14,
-    T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ4_XS = 23,
+    T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22, T_IQ4_XS = 23,
     T_I8 = 24, T_I16 = 25, T_I32 = 26, T_I64 = 27, T_F64 = 28, T_BF16 = 30,
     T_MXFP4 = 39, T_NVFP4 = 40,
 };

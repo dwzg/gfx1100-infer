@@ -11,6 +11,9 @@ inline float bf16_to_fp32(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f;
 float ue4m3_to_fp32_half(uint8_t x);  // NVFP4 sub-block scale (already halved, see quant.cpp)
 
 extern const int8_t k_iq4nl_values[16];  // IQ4_NL / IQ4_XS codebook
+extern const uint32_t k_iq3s_grid[512];  // IQ3_S codebook: four unsigned magnitudes per entry
+extern const uint32_t k_iq3xxs_grid[256];
+extern const uint64_t k_iq2xxs_grid[256], k_iq2xs_grid[512], k_iq2s_grid[1024];  // eight magnitudes per entry
 extern const int8_t k_fp4_values[16];    // MXFP4 / NVFP4 codebook (E2M1 values, doubled)
 
 // Decode `n` elements (a multiple of the type's block size) starting at a block boundary.

@@ -19,10 +19,14 @@ struct PackFormat {
     uint32_t sb_cols;     // columns per super-block
     uint32_t sb_words;    // 32-bit words per super-block per row
     uint32_t src_blocks;  // GGUF blocks per super-block
+    bool needs_table;     // kernel reads a codebook buffer at binding 5 (see pack_table)
 };
 
 // Native layout for a tensor type, or nullptr if it has none (such tensors are stored as fp16).
 const PackFormat *pack_format(uint32_t type);
+
+// Codebook a format's kernel needs as a buffer of `count` words, or nullptr.
+const uint32_t *pack_table(const PackFormat &f, uint32_t *count);
 
 // Transcode rows [row0, row0 + rows) of a matrix with n_in columns into the plane-major layout.
 // `rows_pad` (>= rows, a multiple of 64) is the plane stride; padding rows are zero.

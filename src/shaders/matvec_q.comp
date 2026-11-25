@@ -232,6 +232,108 @@ float superblock(uint xb) {
     }
     return acc;
 }
+#elif defined(FMT_IQ3_S) || defined(FMT_IQ3_XXS) || defined(FMT_IQ2_S) || defined(FMT_IQ2_XS) || defined(FMT_IQ2_XXS)
+// Codebook formats: an index selects a group of unsigned magnitudes from a table, with a separate
+// sign bit per weight.   weight = d * block_scale * (+-magnitude)
+#define SB 256u
+layout(binding = 5) readonly buffer BG { uint grid[]; };
+// Four magnitudes (bytes of m) with sign bits sg[0..3], times four consecutive inputs.
+float dot4s(uint m, uint sg, uint xb) {
+    return uintBitsToFloat(floatBitsToUint(float(m & 0xFFu)) ^ ((sg & 1u) << 31)) * x[xb]
+         + uintBitsToFloat(floatBitsToUint(float((m >> 8) & 0xFFu)) ^ ((sg & 2u) << 30)) * x[xb + 1u]
+         + uintBitsToFloat(floatBitsToUint(float((m >> 16) & 0xFFu)) ^ ((sg & 4u) << 29)) * x[xb + 2u]
+         + uintBitsToFloat(floatBitsToUint(float(m >> 24)) ^ ((sg & 8u) << 28)) * x[xb + 3u];
+}
+// Eight magnitudes from a table of 64-bit entries, stored as two words each.
+float dot8s(uint idx, uint sg, uint xb) { return dot4s(grid[2u * idx], sg, xb) + dot4s(grid[2u * idx + 1u], sg >> 4, xb + 4u); }
+// Sign byte for eight weights from its 7 stored bits: the eighth bit makes the parity even.
+uint signs8(uint s7) { return s7 | ((uint(bitCount(s7)) & 1u) << 7); }
+#define BYTE(v, i) (((v) >> (8u * (i))) & 0xFFu)
+
+#if defined(FMT_IQ3_S)
+#define NW 28u
+// words: 0 = d, 1 = eight 4-bit scales, 2..3 = high index bits, 4..19 = index bytes, 20..27 = sign bytes; table: 512 x 4
+float superblock(uint xb) {
+    float d = unpackHalf2x16(LW(0u)).x;
+    uint scales = LW(1u);
+    float acc = 0.0;
+    for (uint ib = 0u; ib < 8u; ib++) {
+        uint q0 = LW(4u + 2u * ib), q1 = LW(5u + 2u * ib), sgw = LW(20u + ib);
+        uint qh = BYTE(LW(2u + (ib >> 2)), ib & 3u);
+        float a = 0.0;
+        for (uint l = 0u; l < 4u; l++) {
+            uint qw = l < 2u ? q0 : q1, sh = 2u * (l & 1u);
+            uint i1 = BYTE(qw, sh) | ((qh << (8u - 2u * l)) & 256u), i2 = BYTE(qw, sh + 1u) | ((qh << (7u - 2u * l)) & 256u);
+            uint sg = BYTE(sgw, l), c = xb + 32u * ib + 8u * l;
+            a += dot4s(grid[i1], sg, c) + dot4s(grid[i2], sg >> 4, c + 4u);
+        }
+        acc += float(1u + 2u * ((scales >> (4u * ib)) & 15u)) * a;
+    }
+    return d * acc;
+}
+#elif defined(FMT_IQ3_XXS)
+#define NW 25u
+// words: 0 = d, 1..16 = index bytes, 17..24 = four 7-bit sign groups + 4-bit scale; table: 256 x 4
+float superblock(uint xb) {
+    float d = unpackHalf2x16(LW(0u)).x, acc = 0.0;
+    for (uint ib = 0u; ib < 8u; ib++) {
+        uint q0 = LW(1u + 2u * ib), q1 = LW(2u + 2u * ib), sas = LW(17u + ib);
+        float a = 0.0;
+        for (uint l = 0u; l < 4u; l++) {
+            uint qw = l < 2u ? q0 : q1, sh = 2u * (l & 1u), sg = signs8((sas >> (7u * l)) & 127u), c = xb + 32u * ib + 8u * l;
+            a += dot4s(grid[BYTE(qw, sh)], sg, c) + dot4s(grid[BYTE(qw, sh + 1u)], sg >> 4, c + 4u);
+        }
+        acc += (0.5 + float(sas >> 28)) * a;
+    }
+    return d * 0.5 * acc;
+}
+#elif defined(FMT_IQ2_S)
+#define NW 21u
+// words: 0 = d, 1..8 = index bytes, 9..16 = sign bytes, 17..18 = high index bits, 19..20 = two 4-bit scales per 32 weights; table: 1024 x 8
+float superblock(uint xb) {
+    float d = unpackHalf2x16(LW(0u)).x, acc = 0.0;
+    for (uint ib = 0u; ib < 8u; ib++) {
+        uint qw = LW(1u + ib), sgw = LW(9u + ib), qh = BYTE(LW(17u + (ib >> 2)), ib & 3u), sc = BYTE(LW(19u + (ib >> 2)), ib & 3u);
+        float a0 = 0.0, a1 = 0.0;
+        for (uint l = 0u; l < 4u; l++) {
+            float t = dot8s(BYTE(qw, l) | ((qh << (8u - 2u * l)) & 0x300u), BYTE(sgw, l), xb + 32u * ib + 8u * l);
+            if (l < 2u) a0 += t; else a1 += t;
+        }
+        acc += (0.5 + float(sc & 15u)) * a0 + (0.5 + float(sc >> 4)) * a1;
+    }
+    return d * 0.25 * acc;
+}
+#elif defined(FMT_IQ2_XS)
+#define NW 19u
+// words: 0 = d, 1..16 = 16-bit codes (9-bit index, 7 sign bits), 17..18 = two 4-bit scales per 32 weights; table: 512 x 8
+float superblock(uint xb) {
+    float d = unpackHalf2x16(LW(0u)).x, acc = 0.0;
+    for (uint ib = 0u; ib < 8u; ib++) {
+        uint q0 = LW(1u + 2u * ib), q1 = LW(2u + 2u * ib), sc = BYTE(LW(17u + (ib >> 2)), ib & 3u);
+        float a0 = 0.0, a1 = 0.0;
+        for (uint l = 0u; l < 4u; l++) {
+            uint v = ((l < 2u ? q0 : q1) >> (16u * (l & 1u))) & 0xFFFFu;
+            float t = dot8s(v & 511u, signs8(v >> 9), xb + 32u * ib + 8u * l);
+            if (l < 2u) a0 += t; else a1 += t;
+        }
+        acc += (0.5 + float(sc & 15u)) * a0 + (0.5 + float(sc >> 4)) * a1;
+    }
+    return d * 0.25 * acc;
+}
+#else
+#define NW 17u
+// IQ2_XXS words: 0 = d, then per 32 weights: four index bytes, and four 7-bit sign groups + 4-bit scale; table: 256 x 8
+float superblock(uint xb) {
+    float d = unpackHalf2x16(LW(0u)).x, acc = 0.0;
+    for (uint ib = 0u; ib < 8u; ib++) {
+        uint qw = LW(1u + 2u * ib), sas = LW(2u + 2u * ib);
+        float a = 0.0;
+        for (uint l = 0u; l < 4u; l++) a += dot8s(BYTE(qw, l), signs8((sas >> (7u * l)) & 127u), xb + 32u * ib + 8u * l);
+        acc += (0.5 + float(sas >> 28)) * a;
+    }
+    return d * 0.25 * acc;
+}
+#endif
 #else
 #error "no weight format selected"
 #endif

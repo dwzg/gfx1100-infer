@@ -20,8 +20,9 @@ static const struct { uint32_t id; TypeInfo ti; } k_types[] = {
     {T_I8, {"I8", 1, 1, false}},        {T_I16, {"I16", 1, 2, false}},      {T_I32, {"I32", 1, 4, false}},
     {T_I64, {"I64", 1, 8, false}},      {T_F64, {"F64", 1, 8, false}},
     // Known ids without a decoder here (reported by name instead of as a bare number).
-    {9, {"Q8_1", 32, 36, false}},       {16, {"IQ2_XXS", 256, 66, false}},  {17, {"IQ2_XS", 256, 74, false}},
-    {18, {"IQ3_XXS", 256, 98, false}},  {19, {"IQ1_S", 256, 50, false}},    {22, {"IQ2_S", 256, 82, false}},
+    {T_IQ2_XXS, {"IQ2_XXS", 256, 66, true}}, {T_IQ2_XS, {"IQ2_XS", 256, 74, true}}, {T_IQ3_XXS, {"IQ3_XXS", 256, 98, true}},
+    {T_IQ2_S, {"IQ2_S", 256, 82, true}},
+    {9, {"Q8_1", 32, 36, false}},       {19, {"IQ1_S", 256, 50, false}},
     {29, {"IQ1_M", 256, 56, false}},    {34, {"TQ1_0", 256, 54, false}},    {35, {"TQ2_0", 256, 66, false}},
     {41, {"Q1_0", 128, 18, false}},     {42, {"Q2_0", 64, 18, false}},      {43, {"F8_E4M3", 1, 1, false}},
 };

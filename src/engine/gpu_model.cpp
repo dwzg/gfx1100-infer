@@ -14,14 +14,27 @@ namespace {
 struct PcMatvec { uint32_t n_in, n_rows, row0, flags; };
 struct PcMatvecQ { uint32_t n_sb, stride, n_rows, row0, flags; };
 struct PcNorm { uint32_t n, flags; float eps; };
-struct PcAttnPrep { uint32_t hd, nh, nkv, qw, rope_dim, flags; float eps; };
-struct PcAttn { uint32_t hd, nh, nkv, n_ctx, flags; float scale; };
+struct PcAttnPrep { uint32_t hd, nh, nkv, qw, rope_dim, flags; float eps; uint32_t stride; };
+struct PcScore { uint32_t hd, stride, n_ctx; float scale; };
+struct PcVsum { uint32_t hd, nh, nkv, n_ctx, seg; };
+struct PcCombine { uint32_t hd, nh, seg, flags; };
+constexpr uint32_t k_seg = 1024;        // cached positions per value-sum segment
 struct PcDnPrep { uint32_t n_norm, kw; float eps; };
 constexpr uint32_t k_ctl_header = 16;  // bytes before the rotation table
 }  // namespace
 
-GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16, bool kv8) : dev_(dev), g_(g), d_(desc), n_ctx_(n_ctx), force_fp16_(force_fp16), kv8_(kv8) {
-    if (kv8_ && d_.head_dim % 32) throw std::runtime_error("the 8-bit cache needs a head size that is a multiple of 32");
+uint64_t GpuModel::bytes_per_token(const ModelDesc &d, bool kv8) {
+    uint64_t words = kv8 ? d.head_dim / 4 + d.head_dim / 64 : d.head_dim / 2;
+    // key + value cache in every attention layer, one row of scores per query head, and the
+    // per-segment value sums (shared by all layers)
+    return (uint64_t)d.n_attn_layers() * 2 * 4 * d.n_head_kv * words + 4ull * d.n_head + (4ull * d.n_head * d.head_dim + k_seg - 1) / k_seg;
+}
+
+GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16, bool kv8, uint64_t reserve_bytes) : dev_(dev), g_(g), d_(desc), n_ctx_(n_ctx), force_fp16_(force_fp16), kv8_(kv8) {
+    if (kv8_ && d_.head_dim % 64) throw std::runtime_error("the 8-bit cache needs a head size that is a multiple of 64");
+    if (d_.head_dim % 2 || d_.n_head % d_.n_head_kv) throw std::runtime_error("unsupported attention head layout");
+    kv_words_ = kv8_ ? d_.head_dim / 4 + d_.head_dim / 64 : d_.head_dim / 2;
+    ind_ = dev_.alloc_host(32);
     if (d_.head_dim > 256) throw std::runtime_error("attention heads wider than 256 are not supported");
     dummy_ = dev_.alloc(256); dev_.fill_zero(dummy_);
     ctl_ = dev_.alloc_host(k_ctl_header + 4ull * std::max(d_.rope_dim, 2));
@@ -29,7 +42,6 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx,
     logits_host_ = dev_.alloc_host(4ull * d_.n_vocab);
     logits_.resize(d_.n_vocab);
 
-    uint64_t kv_row = (uint64_t)d_.n_head_kv * d_.head_dim;
     layers_.resize(d_.n_layer);
     for (int il = 0; il < d_.n_layer; il++) {
         const LayerDesc &ld = d_.layers[il];
@@ -54,15 +66,31 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx,
                 dequantize(ld.k_norm->type, ld.k_norm->data, both.data() + d_.head_dim, d_.head_dim);
                 l.qk_norm = dev_.alloc(both.size() * 4); dev_.upload(l.qk_norm, both.data(), both.size() * 4);
             }
-            uint64_t bytes = (kv8_ ? 1ull : 2ull) * n_ctx_ * kv_row;
-            if (bytes > dev_.caps().max_storage_range) throw std::runtime_error("context too large for this device's buffer limit");
-            l.kc = dev_.alloc(bytes); l.vc = dev_.alloc(bytes);
-            state_bytes_ += 2 * bytes;
-            if (kv8_) { uint64_t sb = 2ull * n_ctx_ * kv_row / 32; l.ks = dev_.alloc(sb); l.vs = dev_.alloc(sb); state_bytes_ += 2 * sb; }
         }
     }
     output_norm_ = load_vector(d_.output_norm);
     output_ = load_matrix(d_.output);
+
+    // Context size. With n_ctx <= 0, take what the free GPU memory allows.
+    const uint64_t per_pos_layer = 4ull * d_.n_head_kv * kv_words_;
+    const uint64_t limit_ctx = dev_.caps().max_storage_range / std::max<uint64_t>(per_pos_layer, 4ull * d_.n_head) / 64 * 64;
+    if (n_ctx_ <= 0) {
+        const uint64_t fixed = 4ull * (4 * d_.n_embd + 4 * d_.n_ff + d_.n_vocab + 8 * d_.n_head * d_.head_dim + 4 * d_.dn_conv_dim()) + (16ull << 20);
+        uint64_t freeb = dev_.vram_free();
+        if (freeb <= reserve_bytes + fixed) throw std::runtime_error("no GPU memory left for context after loading the weights");
+        uint64_t fit = (freeb - reserve_bytes - fixed) / bytes_per_token(d_, kv8_);
+        if (d_.n_ctx_train > 0) fit = std::min<uint64_t>(fit, d_.n_ctx_train);
+        n_ctx_ = (int)(std::min(fit, limit_ctx) / 64 * 64);
+        if (n_ctx_ < 64) throw std::runtime_error("not enough GPU memory left for any context");
+    }
+    if ((uint64_t)n_ctx_ > limit_ctx) throw std::runtime_error("context too large for this device's buffer limit (maximum " + std::to_string(limit_ctx) + ")");
+    stride_ = ((uint32_t)n_ctx_ + 63) / 64 * 64;
+    for (Layer &l : layers_) {
+        if (l.recurrent) continue;
+        uint64_t kbytes = per_pos_layer * stride_, vbytes = per_pos_layer * (uint64_t)n_ctx_;
+        l.kc = dev_.alloc(kbytes); l.vc = dev_.alloc(vbytes);
+        state_bytes_ += kbytes + vbytes;
+    }
     reset();
     build_program();
 }
@@ -92,6 +120,15 @@ GpuModel::Matrix GpuModel::load_matrix(const TensorInfo *w, const TensorInfo *bi
     const uint64_t limit = std::min<uint64_t>(dev_.caps().max_storage_range, 1ull << 30);
     m.fmt = force_fp16_ ? nullptr : pack_format(w->type);
     if (m.fmt && m.n_in % m.fmt->sb_cols) m.fmt = nullptr;
+    if (m.fmt && m.fmt->needs_table) {
+        bool have = false;
+        for (auto &t : tables_) have |= t.first == m.fmt->type;
+        if (!have) {
+            uint32_t count; const uint32_t *data = pack_table(*m.fmt, &count);
+            Buffer b = dev_.alloc(count * 4ull); dev_.upload(b, data, count * 4ull);
+            tables_.emplace_back(m.fmt->type, b);
+        }
+    }
     if (m.fmt) {
         const uint64_t words_per_row = (uint64_t)(m.n_in / m.fmt->sb_cols) * m.fmt->sb_words;
         uint64_t max_rows = limit / (words_per_row * 4) / 64 * 64;
@@ -147,7 +184,9 @@ void GpuModel::matvec(Program &p, const Matrix &m, const Vec &x, const Buffer &y
         if (m.fmt) {
             uint32_t stride = (rows + 63) / 64 * 64;
             PcMatvecQ pc{m.n_in / m.fmt->sb_cols, stride, rows, row0, flags};
-            p.dispatch(dev_.pipeline(m.fmt->kernel), {R(m.chunks[c]), R(x.v), R(x.s), W(y), R(bias)}, &pc, sizeof pc, stride / 64);
+            std::vector<Binding> b{R(m.chunks[c]), R(x.v), R(x.s), W(y), R(bias)};
+            if (m.fmt->needs_table) for (auto &t : tables_) if (t.first == m.fmt->type) b.push_back(R(t.second));
+            p.dispatch(dev_.pipeline(m.fmt->kernel), b, &pc, sizeof pc, stride / 64);
         } else {
             PcMatvec pc{m.n_in, rows, row0, flags};
             p.dispatch(dev_.pipeline("matvec_f16"), {R(m.chunks[c]), R(x.v), W(y), R(bias)}, &pc, sizeof pc, (rows + 63) / 64);
@@ -162,12 +201,17 @@ void GpuModel::build_program() {
     Buffer x = scratch(n), a = scratch(n), g = scratch(d_.n_ff), u = scratch(d_.n_ff);
     Vec h = scratch_vec(n), act = scratch_vec(d_.n_ff), mix = scratch_vec(nh * hd), dn_on;
     Buffer qfull = scratch((uint64_t)nh * qw), kraw = scratch((uint64_t)nkv * hd), vraw = scratch((uint64_t)nkv * hd);
-    Buffer q = scratch((uint64_t)nh * hd), gate = scratch((uint64_t)nh * hd), scores = scratch((uint64_t)nh * n_ctx_);
+    const uint32_t G = (uint32_t)(nh / nkv), n_seg_max = ((uint32_t)n_ctx_ + k_seg - 1) / k_seg;
+    Buffer q = scratch((uint64_t)nh * hd), gate = scratch((uint64_t)nh * hd), scores = dev_.alloc(4ull * nh * stride_), zsum = scratch(nh);
+    Buffer part = dev_.alloc(4ull * n_seg_max * nh * hd);
     Buffer mixed, z, alpha, beta, qkv, dn_o;
     if (C > 0) { mixed = scratch(C); z = scratch((uint64_t)HV * S); alpha = scratch(HV); beta = scratch(HV); qkv = scratch(C); dn_o = scratch((uint64_t)HV * S); dn_on = scratch_vec(HV * S); }
     Buffer logits = scratch(d_.n_vocab);
 
-    const Pipeline *p_norm = dev_.pipeline("norm"), *p_swiglu = dev_.pipeline("swiglu"), *p_attn = dev_.pipeline(kv8_ ? "attn_kv8" : "attn");
+    const Pipeline *p_norm = dev_.pipeline("norm"), *p_swiglu = dev_.pipeline("swiglu"), *p_soft = dev_.pipeline("attn_soft");
+    const Pipeline *p_score = dev_.pipeline(kv8_ ? "attn_score_kv8" : "attn_score", {G});
+    const Pipeline *p_vsum = dev_.pipeline(kv8_ ? "attn_vsum_kv8" : "attn_vsum", {(uint32_t)(kv8_ ? hd / 4 : hd / 2), G});
+    const Pipeline *p_combine = dev_.pipeline("attn_combine", {(uint32_t)hd});
     const Pipeline *p_prep = dev_.pipeline(kv8_ ? "attn_prep_kv8" : "attn_prep", {(uint32_t)hd});
     const Pipeline *p_dn_prep = C > 0 ? dev_.pipeline("dn_prep", {(uint32_t)S}) : nullptr;
     const Pipeline *p_dn_update = C > 0 ? dev_.pipeline("dn_update", {(uint32_t)S}) : nullptr;
@@ -193,14 +237,17 @@ void GpuModel::build_program() {
         } else {
             matvec(p, l.wq, h, qfull); matvec(p, l.wk, h, kraw); matvec(p, l.wv, h, vraw);
             PcAttnPrep pp{(uint32_t)hd, (uint32_t)nh, (uint32_t)nkv, (uint32_t)qw, (uint32_t)d_.rope_dim,
-                          (l.has_qk_norm ? 1u : 0u) | (d_.q_has_gate ? 2u : 0u) | (d_.rope_half_split ? 4u : 0u), d_.norm_eps};
-            std::vector<Binding> pb{R(qfull), R(kraw), R(vraw), R(l.has_qk_norm ? l.qk_norm : dummy_), R(ctl_), W(q), W(gate), W(l.kc), W(l.vc)};
-            if (kv8_) { pb.push_back(W(l.ks)); pb.push_back(W(l.vs)); }
-            p.dispatch(p_prep, pb, &pp, sizeof pp, std::max(nh, nkv));
-            PcAttn pa{(uint32_t)hd, (uint32_t)nh, (uint32_t)nkv, (uint32_t)n_ctx_, d_.q_has_gate ? 1u : 0u, 1.0f / std::sqrt((float)hd)};
-            std::vector<Binding> ab{R(q), R(gate), R(l.kc), R(l.vc), R(ctl_), W(scores), W(mix.v)};
-            if (kv8_) { ab.push_back(R(l.ks)); ab.push_back(R(l.vs)); }
-            p.dispatch(p_attn, ab, &pa, sizeof pa, nh);
+                          (l.has_qk_norm ? 1u : 0u) | (d_.q_has_gate ? 2u : 0u) | (d_.rope_half_split ? 4u : 0u), d_.norm_eps, stride_};
+            p.dispatch(p_prep, {R(qfull), R(kraw), R(vraw), R(l.has_qk_norm ? l.qk_norm : dummy_), R(ctl_), W(q), W(gate), W(l.kc), W(l.vc)}, &pp, sizeof pp, std::max(nh, nkv));
+            // Group counts for the two position-parallel kernels come from ind_, set per token.
+            PcScore ps{(uint32_t)hd, stride_, stride_, 1.0f / std::sqrt((float)hd)};
+            p.dispatch_indirect(p_score, {R(q), R(l.kc), R(ctl_), W(scores)}, &ps, sizeof ps, ind_.sub(0, 12));
+            uint32_t nctx = stride_;
+            p.dispatch(p_soft, {R(ctl_), W(scores), W(zsum)}, &nctx, sizeof nctx, nh);
+            PcVsum pv{(uint32_t)hd, (uint32_t)nh, (uint32_t)nkv, stride_, k_seg};
+            p.dispatch_indirect(p_vsum, {R(l.vc), R(scores), R(ctl_), W(part)}, &pv, sizeof pv, ind_.sub(16, 12));
+            PcCombine pcb{(uint32_t)hd, (uint32_t)nh, k_seg, d_.q_has_gate ? 1u : 0u};
+            p.dispatch(p_combine, {R(part), R(zsum), R(gate), R(ctl_), W(mix.v)}, &pcb, sizeof pcb, nh);
             blocksum(p, mix);
             matvec(p, l.wo, mix, a);
         }
@@ -236,6 +283,8 @@ void GpuModel::eval_one(int32_t token) {
         double theta = (double)pos * std::pow((double)d_.rope_base, -2.0 * i / d_.rope_dim);
         rot[2 * i] = (float)std::cos(theta); rot[2 * i + 1] = (float)std::sin(theta);
     }
+    uint32_t ind[8] = {pos / 64 + 1, (uint32_t)d_.n_head_kv, 1, 0, pos / k_seg + 1, (uint32_t)d_.n_head_kv, 1, 0};
+    memcpy(ind_.mapped, ind, sizeof ind);
     program_->run();
     n_past_++;
 }

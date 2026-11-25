@@ -200,7 +200,7 @@ uint32_t Device::find_memory_type(uint32_t type_bits, bool host) const {
 Device::Arena Device::new_arena(uint64_t size, bool host) {
     Arena a{}; a.size = size;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = size; bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.size = size; bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     check(vkCreateBuffer(dev_, &bci, nullptr, &a.buf), "vkCreateBuffer");
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(dev_, a.buf, &req);
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = req.size; mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, host);
@@ -221,16 +221,38 @@ Buffer Device::alloc_from(std::vector<Arena> &arenas, uint64_t size, bool host) 
     uint64_t align = std::max<uint64_t>(caps_.storage_align, 256);
     size = (size + 255) & ~255ull;
     if (size > caps_.max_storage_range) throw std::runtime_error("internal: buffer of " + std::to_string(size) + " bytes exceeds the device's storage binding limit");
+    // Large device buffers get an allocation of exactly their size, so no arena space is stranded.
+    if (!host && size >= (16ull << 20)) {
+        arenas.push_back(new_arena(size, false));
+        arenas.back().used = size;
+        return Buffer{arenas.back().buf, 0, size, nullptr};
+    }
     for (auto &a : arenas) {
         uint64_t off = (a.used + align - 1) / align * align;
         if (off + size <= a.size) { a.used = off + size; return Buffer{a.buf, off, size, a.mapped ? (char *)a.mapped + off : nullptr}; }
     }
-    uint64_t block = host ? (64ull << 20) : (512ull << 20);
+    uint64_t block = 64ull << 20;
     block = std::min<uint64_t>(block, std::min(caps_.max_alloc, caps_.max_buffer) / 2);
     arenas.push_back(new_arena(std::max(size, block), host));
     Arena &a = arenas.back(); a.used = size;
     return Buffer{a.buf, 0, size, a.mapped};
 }
+uint64_t Device::vram_free() const {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    if (caps_.memory_budget) mp.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(phys_, &mp);
+    uint64_t best = 0, best_size = 0;
+    for (uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount; i++) {
+        const VkMemoryHeap &h = mp.memoryProperties.memoryHeaps[i];
+        if (!(h.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) || h.size < best_size) continue;
+        best_size = h.size;
+        if (caps_.memory_budget) best = budget.heapBudget[i] > budget.heapUsage[i] ? budget.heapBudget[i] - budget.heapUsage[i] : 0;
+        else best = h.size > allocated_ ? h.size - allocated_ : 0;
+    }
+    return best;
+}
+
 Buffer Device::alloc(uint64_t size) { return alloc_from(device_arenas_, size, false); }
 Buffer Device::alloc_host(uint64_t size) { return alloc_from(host_arenas_, size, true); }
 
@@ -371,10 +393,9 @@ void Program::barrier() {
     pending_reads_.clear(); pending_writes_.clear(); n_barrier_++;
 }
 
-void Program::dispatch(const Pipeline *p, const std::vector<Binding> &bindings, const void *pc, size_t pc_bytes, uint32_t gx, uint32_t gy, uint32_t gz) {
+void Program::prepare(const Pipeline *p, const std::vector<Binding> &bindings, const void *pc, size_t pc_bytes) {
     if (finished_) throw std::runtime_error("internal: program already finished");
     if (bindings.size() > k_max_bindings || pc_bytes > k_push_bytes) throw std::runtime_error("internal: too many bindings or push constants");
-    if (gx == 0 || gy == 0 || gz == 0) return;
     // A dispatch must wait for earlier un-synchronised work if it reads what that work writes,
     // or writes what that work reads or writes.
     bool conflict = false;
@@ -394,8 +415,18 @@ void Program::dispatch(const Pipeline *p, const std::vector<Binding> &bindings, 
     }
     dev_.push_descriptor_(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, dev_.layout_, 0, (uint32_t)bindings.size(), writes);
     if (pc_bytes) vkCmdPushConstants(cmd_, dev_.layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)pc_bytes, pc);
-    vkCmdDispatch(cmd_, gx, gy, gz);
     n_dispatch_++;
+}
+
+void Program::dispatch(const Pipeline *p, const std::vector<Binding> &bindings, const void *pc, size_t pc_bytes, uint32_t gx, uint32_t gy, uint32_t gz) {
+    if (gx == 0 || gy == 0 || gz == 0) return;
+    prepare(p, bindings, pc, pc_bytes);
+    vkCmdDispatch(cmd_, gx, gy, gz);
+}
+
+void Program::dispatch_indirect(const Pipeline *p, const std::vector<Binding> &bindings, const void *pc, size_t pc_bytes, const Buffer &args) {
+    prepare(p, bindings, pc, pc_bytes);
+    vkCmdDispatchIndirect(cmd_, args.handle, args.offset);
 }
 
 void Program::copy(const Buffer &src, const Buffer &dst) {

@@ -45,9 +45,17 @@ float ue4m3_to_fp32_half(uint8_t x) {
 
 const int8_t k_iq4nl_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 const int8_t k_fp4_values[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
-static const uint32_t k_iq3s_grid[512] = {
+const uint32_t k_iq3s_grid[512] = {
 #include "iq3s_grid.inc"
 };
+
+#include "iq_grids.inc"
+
+// Sign byte for eight weights from its 7 stored bits: the eighth bit makes the parity even.
+static inline uint32_t signs8(uint32_t s7) { return s7 | ((uint32_t)(__builtin_popcount(s7) & 1) << 7); }
+static inline void put8(float *y, float db, uint64_t grid, uint32_t signs) {
+    for (int j = 0; j < 8; j++) y[j] = db * (float)((grid >> (8 * j)) & 255) * ((signs >> j) & 1 ? -1.f : 1.f);
+}
 
 static inline float h16(const uint8_t *p) { uint16_t h; memcpy(&h, p, 2); return fp16_to_fp32(h); }
 
@@ -154,6 +162,42 @@ static void dq_iq3_s(const uint8_t *b, float *y) {
         }
     }
 }
+static void dq_iq2_xxs(const uint8_t *b, float *y) {
+    float d = h16(b);
+    for (int ib = 0; ib < 8; ib++) {
+        uint32_t aux[2]; memcpy(aux, b + 2 + 8 * ib, 8);
+        float db = d * (0.5f + (float)(aux[1] >> 28)) * 0.25f;
+        for (int l = 0; l < 4; l++, y += 8) put8(y, db, k_iq2xxs_grid[(aux[0] >> (8 * l)) & 255], signs8((aux[1] >> (7 * l)) & 127));
+    }
+}
+static void dq_iq2_xs(const uint8_t *b, float *y) {
+    float d = h16(b); const uint8_t *scales = b + 66;
+    for (int ib = 0; ib < 8; ib++)
+        for (int l = 0; l < 4; l++, y += 8) {
+            uint16_t q; memcpy(&q, b + 2 + 2 * (4 * ib + l), 2);
+            float db = d * (0.5f + (float)(l < 2 ? scales[ib] & 15 : scales[ib] >> 4)) * 0.25f;
+            put8(y, db, k_iq2xs_grid[q & 511], signs8(q >> 9));
+        }
+}
+static void dq_iq2_s(const uint8_t *b, float *y) {
+    float d = h16(b); const uint8_t *qs = b + 2, *signs = b + 34, *qh = b + 66, *scales = b + 74;
+    for (int ib = 0; ib < 8; ib++)
+        for (int l = 0; l < 4; l++, y += 8) {
+            float db = d * (0.5f + (float)(l < 2 ? scales[ib] & 15 : scales[ib] >> 4)) * 0.25f;
+            put8(y, db, k_iq2s_grid[qs[4 * ib + l] | ((qh[ib] << (8 - 2 * l)) & 0x300)], signs[4 * ib + l]);
+        }
+}
+static void dq_iq3_xxs(const uint8_t *b, float *y) {
+    float d = h16(b); const uint8_t *qs = b + 2;
+    for (int ib = 0; ib < 8; ib++) {
+        uint32_t aux; memcpy(&aux, b + 66 + 4 * ib, 4);
+        float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        for (int l = 0; l < 4; l++, y += 8) {
+            uint64_t g = (uint64_t)k_iq3xxs_grid[qs[8 * ib + 2 * l]] | ((uint64_t)k_iq3xxs_grid[qs[8 * ib + 2 * l + 1]] << 32);
+            put8(y, db, g, signs8((aux >> (7 * l)) & 127));
+        }
+    }
+}
 static void dq_mxfp4(const uint8_t *b, float *y) {
     // E8M0 scale, halved (codebook is doubled): 2^(e-127) * 0.5
     float d = std::ldexp(1.0f, (int)b[0] - 128); const uint8_t *qs = b + 1;
@@ -191,6 +235,10 @@ bool dequantize(uint32_t type, const uint8_t *src, float *dst, uint64_t n) {
             case T_IQ4_NL: dq_iq4_nl(src, dst); break;
             case T_IQ4_XS: dq_iq4_xs(src, dst); break;
             case T_IQ3_S: dq_iq3_s(src, dst); break;
+            case T_IQ2_XXS: dq_iq2_xxs(src, dst); break;
+            case T_IQ2_XS: dq_iq2_xs(src, dst); break;
+            case T_IQ2_S: dq_iq2_s(src, dst); break;
+            case T_IQ3_XXS: dq_iq3_xxs(src, dst); break;
             case T_MXFP4: dq_mxfp4(src, dst); break;
             case T_NVFP4: dq_nvfp4(src, dst); break;
             default: return false;

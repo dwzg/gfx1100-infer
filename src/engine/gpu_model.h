@@ -15,7 +15,11 @@ class GpuModel {
     // force_fp16: store every matrix as half-precision rows (the simple baseline path, for testing).
     // kv8: keep the key/value cache as 8-bit integers with a scale per 32 values (about half the
     //      memory and memory traffic of the half-precision cache, at a small accuracy cost).
-    GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16 = false, bool kv8 = false);
+    // n_ctx <= 0: use as much context as fits in the GPU memory that is free after loading the
+    //      weights (capped at the model's trained context), keeping `reserve_bytes` unallocated.
+    GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16 = false, bool kv8 = false, uint64_t reserve_bytes = 256ull << 20);
+    // GPU bytes one token of context costs, for a given cache type.
+    static uint64_t bytes_per_token(const ModelDesc &d, bool kv8);
     ~GpuModel();
 
     void reset();
@@ -43,8 +47,7 @@ class GpuModel {
         bool recurrent = false;
         Buffer attn_norm, ffn_norm, qk_norm;
         Matrix wq, wk, wv, wo, wqkv, wz, wbeta, walpha, ssm_out, ffn_gate, ffn_up, ffn_down;
-        Buffer kc, vc;                    // key / value cache
-        Buffer ks, vs;                    // per-block scales (8-bit cache only)
+        Buffer kc, vc;                    // key cache (plane-major) / value cache (row-major)
         Buffer conv_w, dt, a, ssm_norm, state, hist;
         bool has_qk_norm = false;
     };
@@ -65,7 +68,9 @@ class GpuModel {
     std::vector<Layer> layers_;
     Buffer output_norm_;
     Matrix output_;
-    Buffer ctl_, embd_, logits_host_, dummy_;
+    Buffer ctl_, ind_, embd_, logits_host_, dummy_;
+    std::vector<std::pair<uint32_t, Buffer>> tables_;   // codebooks, by tensor type
+    uint32_t stride_ = 0, kv_words_ = 0;   // cache plane stride (positions, padded) and words per head per position
     std::vector<Buffer> zero_on_reset_;
     std::unique_ptr<Program> program_;
     std::vector<float> logits_;

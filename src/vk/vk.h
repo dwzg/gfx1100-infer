@@ -58,6 +58,8 @@ class Program {
     Program(const Program &) = delete;
     // Bindings are pushed in order to binding points 0, 1, ...
     void dispatch(const Pipeline *p, const std::vector<Binding> &bindings, const void *pc, size_t pc_bytes, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1);
+    // Like dispatch, with the group counts (three uint32) read from `args` at submission time.
+    void dispatch_indirect(const Pipeline *p, const std::vector<Binding> &bindings, const void *pc, size_t pc_bytes, const Buffer &args);
     void copy(const Buffer &src, const Buffer &dst);
     void finish();
     void run();              // submit and wait
@@ -67,6 +69,7 @@ class Program {
     struct Range { VkBuffer b; uint64_t lo, hi; };
     static bool overlaps(const std::vector<Range> &set, const Range &r);
     void barrier();
+    void prepare(const Pipeline *p, const std::vector<Binding> &bindings, const void *pc, size_t pc_bytes);
     Device &dev_;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
@@ -95,6 +98,9 @@ class Device {
     void download(const Buffer &src, void *data, uint64_t size);
     void fill_zero(const Buffer &dst);
     uint64_t allocated_bytes() const { return allocated_; }
+    // GPU memory this process can still allocate right now, as the driver reports it (it accounts
+    // for other programs such as the desktop). Falls back to heap size minus our own use.
+    uint64_t vram_free() const;
 
     // Compute pipeline for an embedded kernel. `spec` are specialization constants with ids 0, 1, ...
     // `subgroup` (0, 32 or 64) requests a wave size where the driver allows choosing one.

@@ -1,0 +1,22 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Finish attention for one query head (one workgroup per head, one lane per dimension): add the
+// per-segment sums, normalise by the softmax sum, apply the optional sigmoid gate.
+#include "common.glsl"
+layout(local_size_x_id = 0) in;   // = head_dim
+layout(binding = 0) readonly buffer BP { float part[]; };
+layout(binding = 1) readonly buffer BZ { float z[]; };
+layout(binding = 2) readonly buffer BGT { float gate[]; };
+layout(binding = 3) readonly buffer BCTL { uint pos; } ctl;
+layout(binding = 4) writeonly buffer BMIX { float mix[]; };
+layout(push_constant) uniform PC { uint hd; uint nh; uint seg; uint flags; } pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x, d = gl_LocalInvocationID.x;
+    uint n_seg = ctl.pos / pc.seg + 1u;
+    float acc = 0.0;
+    for (uint sg = 0u; sg < n_seg; sg++) acc += part[(sg * pc.nh + h) * pc.hd + d];
+    acc *= z[h];
+    if ((pc.flags & 1u) != 0u) acc *= sigmoid(gate[h * pc.hd + d]);
+    mix[h * pc.hd + d] = acc;
+}

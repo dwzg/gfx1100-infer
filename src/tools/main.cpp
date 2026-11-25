@@ -93,7 +93,7 @@ static int cmd_plan(int argc, char **argv) {
                                     l.ssm_a, l.wbeta, l.walpha, l.ssm_norm, l.ssm_out, l.ffn_gate, l.ffn_up, l.ffn_down}) add(t);
     add(d.output_norm); add(d.output);
     uint64_t weights = native + fallback + small, rec = d.recurrent_state_bytes();
-    uint64_t kv16 = d.kv_bytes_per_token(2), kv8 = d.kv_bytes_per_token(1) + d.kv_bytes_per_token(1) / 16;  // int8 + one fp16 scale per 32 values
+    uint64_t kv16 = GpuModel::bytes_per_token(d, false), kv8 = GpuModel::bytes_per_token(d, true);
     printf("model            %s (%s), %d layers, %d with a context-length cache\n", d.name.c_str(), d.arch_name.c_str(), d.n_layer, d.n_attn_layers());
     printf("weights on GPU   %.2f GiB  (native layouts %.2f, half-precision fallback %.2f)\n", weights / GiB, native / GiB, fallback / GiB);
     for (auto &[n, b] : fb_types) if (b > 0.005 * GiB) printf("                 fallback: %s tensors take %.2f GiB as half precision\n", n.c_str(), b / GiB);
@@ -175,10 +175,10 @@ static int cmd_tokenize(int argc, char **argv) {
 static int cmd_run(int argc, char **argv) {
     if (argc < 1) {
         fprintf(stderr, "usage: gfxi run <model.gguf> -p <prompt | @file> [-n tokens] [--chat] [--temp T] [--top-k K] [--top-p P]\n"
-                        "                [--seed S] [--ctx N] [--threads N] [--device gpu|cpu|<name>] [--kv8] [--logits out.f32]\n");
+                        "                [--seed S] [--ctx N|max] [--reserve GiB] [--threads N] [--device gpu|cpu|<name>] [--kv8] [--logits out.f32]\n");
         return 2;
     }
-    std::string prompt, logits_path, device = "gpu"; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false, kv8 = false;
+    std::string prompt, logits_path, device = "gpu"; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false, kv8 = false, ctx_max = false; double reserve_gib = 0.25;
     SamplerParams sp; sp.temperature = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -190,7 +190,8 @@ static int cmd_run(int argc, char **argv) {
         else if (a == "--top-k") sp.top_k = atoi(next());
         else if (a == "--top-p") sp.top_p = (float)atof(next());
         else if (a == "--seed") sp.seed = strtoull(next(), nullptr, 10);
-        else if (a == "--ctx") n_ctx = atoi(next());
+        else if (a == "--ctx") { std::string v = next(); if (v == "max") ctx_max = true; else n_ctx = atoi(v.c_str()); }
+        else if (a == "--reserve") reserve_gib = atof(next());
         else if (a == "--threads") threads = atoi(next());
         else if (a == "--logits") logits_path = next();
         else if (a == "--device") device = next();
@@ -213,9 +214,10 @@ static int cmd_run(int argc, char **argv) {
     } else {
         dev = std::make_unique<Device>(device == "gpu" ? "" : device);
         fprintf(stderr, "[%s] loading %s ...\n", dev->caps().name.c_str(), desc.name.c_str());
-        gpu = std::make_unique<GpuModel>(*dev, g, desc, n_ctx, false, kv8);
-        fprintf(stderr, "[%s] weights %.2f GiB, context state %.2f GiB, %zu dispatches and %zu sync points per token, %d prompt tokens\n", dev->caps().name.c_str(),
-                gpu->weight_bytes() / 1073741824.0, gpu->state_bytes() / 1073741824.0, gpu->dispatches_per_token(), gpu->barriers_per_token(), (int)ids.size());
+        gpu = std::make_unique<GpuModel>(*dev, g, desc, ctx_max ? 0 : n_ctx, false, kv8, (uint64_t)(reserve_gib * 1073741824.0));
+        if ((int)ids.size() >= gpu->n_ctx()) throw std::runtime_error("the prompt (" + std::to_string(ids.size()) + " tokens) does not fit the context (" + std::to_string(gpu->n_ctx()) + ")");
+        fprintf(stderr, "[%s] weights %.2f GiB, context %d tokens (%s cache, %.2f GiB), %zu dispatches and %zu sync points per token, %d prompt tokens\n", dev->caps().name.c_str(),
+                gpu->weight_bytes() / 1073741824.0, gpu->n_ctx(), kv8 ? "8-bit" : "half-precision", gpu->state_bytes() / 1073741824.0, gpu->dispatches_per_token(), gpu->barriers_per_token(), (int)ids.size());
         eval = [&](const int32_t *t, int n) -> const std::vector<float> & { return gpu->eval(t, n); };
     }
     Sampler sampler(sp);
@@ -293,7 +295,7 @@ static int cmd_devices() {
     Device dev;
     const DeviceCaps &c = dev.caps();
     printf("\nselected: %s (driver %s)\n", c.name.c_str(), c.driver.c_str());
-    printf("  GPU memory            %.1f GiB\n", c.vram_bytes / 1073741824.0);
+    printf("  GPU memory            %.1f GiB, %.1f GiB free right now\n", c.vram_bytes / 1073741824.0, dev.vram_free() / 1073741824.0);
     printf("  wave size             %u (selectable %u..%u: %s)\n", c.subgroup_size, c.min_subgroup, c.max_subgroup, c.subgroup_size_control ? "yes" : "no");
     printf("  matrix instructions   %s\n", c.coop_matrix ? "yes (VK_KHR_cooperative_matrix)" : "no");
     printf("  packed integer dot    %s\n", c.int_dot_4x8_mixed_accel ? "yes, hardware accelerated" : c.int_dot ? "supported, not accelerated" : "no");
@@ -420,8 +422,13 @@ static int cmd_test_matvec(int argc, char **argv) {
     Buffer bw = dev.alloc(words * 4), bx = dev.alloc(n_in * 4ull), bxs = dev.alloc(xs.size() * 4), by = dev.alloc(stride * 4ull), dummy = dev.alloc(256);
     dev.upload(bw, packed.data(), words * 4); dev.upload(bx, x.data(), n_in * 4ull); dev.upload(bxs, xs.data(), xs.size() * 4); dev.fill_zero(dummy);
     struct { uint32_t n_sb, stride, n_rows, row0, flags; } pc{n_in / pf->sb_cols, stride, rows, 0, 0};
+    std::vector<Binding> binds{R(bw), R(bx), R(bxs), W(by), R(dummy)};
+    if (pf->needs_table) {
+        uint32_t count; const uint32_t *data = pack_table(*pf, &count);
+        Buffer bt = dev.alloc(count * 4ull); dev.upload(bt, data, count * 4ull); binds.push_back(R(bt));
+    }
     Program p(dev);
-    p.dispatch(dev.pipeline(pf->kernel), {R(bw), R(bx), R(bxs), W(by), R(dummy)}, &pc, sizeof pc, stride / 64);
+    p.dispatch(dev.pipeline(pf->kernel), binds, &pc, sizeof pc, stride / 64);
     p.finish(); p.run();
     dev.download(by, got.data(), rows * 4ull);
     double err = 0; for (uint32_t i = 0; i < rows; i++) { double d = (double)got[i] - want[i]; err += d * d; }

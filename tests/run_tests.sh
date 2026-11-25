@@ -15,7 +15,7 @@ ggufs=("$MODELS"/*/*.gguf)
 
 # 1. Weight decoders against the gguf Python package (optional: needs `pip install gguf numpy`).
 if "$PY" -c "import gguf, numpy" 2>/dev/null; then
-  raw=(); for t in 10 11 20 21 23 40; do [ -f "$MODELS/samples/q_$t.bin" ] && raw+=(--raw "$t:$MODELS/samples/q_$t.bin"); done
+  raw=(); for t in 10 11 16 17 18 20 21 22 23 40; do [ -f "$MODELS/samples/q_$t.bin" ] && raw+=(--raw "$t:$MODELS/samples/q_$t.bin"); done
   run "$PY" "$(dirname "$0")/test_quant.py" "$GFXI" "${raw[@]}" "${ggufs[@]}"
 else echo "--- skipping decoder test (python packages gguf, numpy not installed)"; fi
 
@@ -26,7 +26,7 @@ if "$PY" -c "import tokenizers" 2>/dev/null; then
 else echo "--- skipping tokenizer test (python package tokenizers not installed)"; fi
 
 # 3. Quantised matvec kernels on raw weight samples.
-for spec in 23:5120 20:5120 11:5120 40:2304; do
+for spec in 23:5120 20:5120 11:5120 21:5120 18:5120 22:5120 17:5120 16:5120 40:2304; do
   t=${spec%%:*}; n=${spec##*:}
   [ -f "$MODELS/samples/q_$t.bin" ] && run "$GFXI" test-matvec "$t" "$MODELS/samples/q_$t.bin" "$n"
 done
