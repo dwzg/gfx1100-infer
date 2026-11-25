@@ -8,7 +8,7 @@
 namespace gfx {
 
 namespace {
-constexpr uint32_t k_max_bindings = 10;
+constexpr uint32_t k_max_bindings = 12;
 constexpr uint32_t k_push_bytes = 128;
 constexpr uint64_t k_staging_bytes = 64ull << 20;
 

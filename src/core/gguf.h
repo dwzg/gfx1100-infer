@@ -72,7 +72,9 @@ class GGUF {
     GGUF &operator=(const GGUF &) = delete;
 
     // Throws std::runtime_error with a readable message on malformed input.
-    void open(const std::string &path);
+    // allow_truncated: accept a file that ends before its tensor data (for example a downloaded
+    // header); tensors that are not fully present get data == nullptr.
+    void open(const std::string &path, bool allow_truncated = false);
 
     const MetaValue *find(std::string_view key) const;
     // Typed getters with defaults; key may be given without the "<arch>." prefix via arch_key().

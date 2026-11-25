@@ -61,6 +61,62 @@ static int cmd_info(int argc, char **argv) {
     return 0;
 }
 
+// Memory plan: what the model needs on the GPU and how much context fits. Works on a header-only
+// download too, since it only needs tensor shapes and types.
+static int cmd_plan(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "usage: gfxi plan <model.gguf> [--vram GiB] [--reserve GiB] [--ctx N]\n"); return 2; }
+    double vram = 24.0, reserve = 0.75; long ctx = 0;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
+        if (a == "--vram") vram = atof(next());
+        else if (a == "--reserve") reserve = atof(next());
+        else if (a == "--ctx") ctx = atol(next());
+        else throw std::runtime_error("unknown option " + a);
+    }
+    GGUF g; g.open(argv[0], true);
+    ModelDesc d = describe_model(g);
+    const double GiB = 1073741824.0;
+    // Weights that live on the GPU: every matrix the forward pass multiplies by, in its native layout
+    // where one exists and as half precision otherwise. The embedding table stays on the CPU unless
+    // it doubles as the output projection.
+    uint64_t native = 0, fallback = 0, small = 0; std::map<std::string, uint64_t> fb_types;
+    auto add = [&](const TensorInfo *t) {
+        if (!t) return;
+        if (t->dims.size() < 2 || t->dim(1) == 1) { small += t->nelems * 4; return; }
+        const PackFormat *pf = pack_format(t->type);
+        if (pf && t->dim(0) % pf->sb_cols == 0) native += (t->dim(0) / pf->sb_cols) * pf->sb_words * 4 * ((t->dim(1) + 63) / 64 * 64);
+        else { fallback += t->nelems * 2; fb_types[type_info(t->type)->name] += t->nelems * 2; }
+    };
+    for (const LayerDesc &l : d.layers)
+        for (const TensorInfo *t : {l.attn_norm, l.ffn_norm, l.wq, l.wk, l.wv, l.wo, l.bq, l.bk, l.bv, l.bo, l.q_norm, l.k_norm, l.wqkv, l.wz, l.conv, l.dt_bias,
+                                    l.ssm_a, l.wbeta, l.walpha, l.ssm_norm, l.ssm_out, l.ffn_gate, l.ffn_up, l.ffn_down}) add(t);
+    add(d.output_norm); add(d.output);
+    uint64_t weights = native + fallback + small, rec = d.recurrent_state_bytes();
+    uint64_t kv16 = d.kv_bytes_per_token(2), kv8 = d.kv_bytes_per_token(1) + d.kv_bytes_per_token(1) / 16;  // int8 + one fp16 scale per 32 values
+    printf("model            %s (%s), %d layers, %d with a context-length cache\n", d.name.c_str(), d.arch_name.c_str(), d.n_layer, d.n_attn_layers());
+    printf("weights on GPU   %.2f GiB  (native layouts %.2f, half-precision fallback %.2f)\n", weights / GiB, native / GiB, fallback / GiB);
+    for (auto &[n, b] : fb_types) if (b > 0.005 * GiB) printf("                 fallback: %s tensors take %.2f GiB as half precision\n", n.c_str(), b / GiB);
+    if (d.output != d.tok_embd) printf("embedding table  stays on the CPU (%.2f GiB in the file)\n", d.tok_embd->nbytes / GiB);
+    printf("fixed state      %.2f GiB  (linear-attention layers, independent of context)\n", rec / GiB);
+    printf("cache per token  %.1f KiB half precision, %.1f KiB 8-bit\n", kv16 / 1024.0, kv8 / 1024.0);
+    double freeb = (vram - reserve) * GiB - (double)weights - (double)rec - 0.15 * GiB;  // 0.15 GiB working buffers
+    printf("budget           %.1f GiB GPU memory, %.2f GiB kept free for the desktop and driver\n", vram, reserve);
+    if (freeb <= 0) { printf("does not fit: weights alone exceed the budget by %.2f GiB\n", -freeb / GiB); return 1; }
+    long max16 = (long)(freeb / kv16), max8 = (long)(freeb / kv8);
+    auto capped = [&](long v) { return d.n_ctx_train > 0 && v > d.n_ctx_train ? d.n_ctx_train : v; };
+    printf("context that fits  %ld tokens (half-precision cache), %ld tokens (8-bit cache); the model was trained for %d\n", capped(max16), capped(max8), d.n_ctx_train);
+    if (ctx > 0) printf("at %ld tokens      cache %.2f GiB half precision / %.2f GiB 8-bit -> %s\n", ctx, ctx * (double)kv16 / GiB, ctx * (double)kv8 / GiB,
+                        ctx <= max16 ? "fits either way" : ctx <= max8 ? "fits with the 8-bit cache only" : "does not fit");
+    // Bytes the GPU must read per generated token: all weights once, plus the cache once.
+    double per_tok = (double)weights + (double)rec * 2;
+    printf("memory read per token  %.2f GiB of weights and state, plus the filled cache (%.1f KiB per token of context)\n", per_tok / GiB, kv16 / 1024.0);
+    for (long c : {4096L, 32768L, 131072L})
+        if (c <= max8) printf("  bandwidth ceiling at %6ld tokens of context: %5.1f tok/s (half-precision cache), %5.1f tok/s (8-bit), for 960 GB/s\n", c,
+                              960e9 / (per_tok + (double)c * kv16), 960e9 / (per_tok + (double)c * kv8));
+    return 0;
+}
+
 // Decode one tensor to raw little-endian float32 (used by the test-suite to compare decoders).
 static int cmd_dequant(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: gfxi dequant <model.gguf> <tensor> <out.f32> [max_elems]\n"); return 2; }
@@ -119,10 +175,10 @@ static int cmd_tokenize(int argc, char **argv) {
 static int cmd_run(int argc, char **argv) {
     if (argc < 1) {
         fprintf(stderr, "usage: gfxi run <model.gguf> -p <prompt | @file> [-n tokens] [--chat] [--temp T] [--top-k K] [--top-p P]\n"
-                        "                [--seed S] [--ctx N] [--threads N] [--device gpu|cpu|<name>] [--logits out.f32]\n");
+                        "                [--seed S] [--ctx N] [--threads N] [--device gpu|cpu|<name>] [--kv8] [--logits out.f32]\n");
         return 2;
     }
-    std::string prompt, logits_path, device = "gpu"; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false;
+    std::string prompt, logits_path, device = "gpu"; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false, kv8 = false;
     SamplerParams sp; sp.temperature = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -138,6 +194,7 @@ static int cmd_run(int argc, char **argv) {
         else if (a == "--threads") threads = atoi(next());
         else if (a == "--logits") logits_path = next();
         else if (a == "--device") device = next();
+        else if (a == "--kv8") kv8 = true;
         else throw std::runtime_error("unknown option " + a);
     }
     GGUF g; g.open(argv[0]);
@@ -156,7 +213,7 @@ static int cmd_run(int argc, char **argv) {
     } else {
         dev = std::make_unique<Device>(device == "gpu" ? "" : device);
         fprintf(stderr, "[%s] loading %s ...\n", dev->caps().name.c_str(), desc.name.c_str());
-        gpu = std::make_unique<GpuModel>(*dev, g, desc, n_ctx);
+        gpu = std::make_unique<GpuModel>(*dev, g, desc, n_ctx, false, kv8);
         fprintf(stderr, "[%s] weights %.2f GiB, context state %.2f GiB, %zu dispatches and %zu sync points per token, %d prompt tokens\n", dev->caps().name.c_str(),
                 gpu->weight_bytes() / 1073741824.0, gpu->state_bytes() / 1073741824.0, gpu->dispatches_per_token(), gpu->barriers_per_token(), (int)ids.size());
         eval = [&](const int32_t *t, int n) -> const std::vector<float> & { return gpu->eval(t, n); };
@@ -189,7 +246,7 @@ static int cmd_run(int argc, char **argv) {
 // Run the GPU engine and the CPU reference on the same tokens and report how closely they agree.
 static int cmd_compare(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "usage: gfxi compare <model.gguf> [-p prompt] [-n extra tokens] [--device name] [--tol T]\n"); return 2; }
-    std::string prompt = "The quick brown fox jumps over the lazy dog. In 1969, humans first", device; int n_extra = 8; double tol = 0.05; bool fp16 = false;
+    std::string prompt = "The quick brown fox jumps over the lazy dog. In 1969, humans first", device; int n_extra = 8; double tol = 0.05; bool fp16 = false, kv8 = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
@@ -198,6 +255,7 @@ static int cmd_compare(int argc, char **argv) {
         else if (a == "--device") device = next();
         else if (a == "--tol") tol = atof(next());
         else if (a == "--fp16") fp16 = true;
+        else if (a == "--kv8") kv8 = true;
         else throw std::runtime_error("unknown option " + a);
     }
     GGUF g; g.open(argv[0]);
@@ -206,7 +264,7 @@ static int cmd_compare(int argc, char **argv) {
     std::vector<int32_t> ids = tok.encode(prompt, true, true);
     int n_ctx = (int)ids.size() + n_extra + 1;
     Device dev(device);
-    GpuModel gpu(dev, g, desc, n_ctx, fp16);
+    GpuModel gpu(dev, g, desc, n_ctx, fp16, kv8);
     printf("weights on device: %.3f GiB\n", gpu.weight_bytes() / 1073741824.0);
     RefModel ref(g, desc, n_ctx, (int)std::thread::hardware_concurrency());
     printf("device %s, model %s, %zu prompt tokens + %d generated\n", dev.caps().name.c_str(), desc.name.c_str(), ids.size(), n_extra);
@@ -318,6 +376,7 @@ static int cmd_kernels(int argc, char **argv) {
 int main(int argc, char **argv) {
     try {
         if (argc >= 2 && !strcmp(argv[1], "info")) return cmd_info(argc - 2, argv + 2);
+        if (argc >= 2 && !strcmp(argv[1], "plan")) return cmd_plan(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "dequant")) return cmd_dequant(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "run")) return cmd_run(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "compare")) return cmd_compare(argc - 2, argv + 2);
@@ -327,6 +386,7 @@ int main(int argc, char **argv) {
         if (argc >= 2 && !strcmp(argv[1], "tokenize")) return cmd_tokenize(argc - 2, argv + 2);
         if (argc >= 2 && !strcmp(argv[1], "dequant-raw")) return cmd_dequant_raw(argc - 2, argv + 2);
         fprintf(stderr, "usage: gfxi <command> ...\n  info <model.gguf> [--tensors]   show model metadata and weight encodings\n"
+                        "  plan <model.gguf> [--vram GiB]  GPU memory needed and how much context fits\n"
                         "  run <model.gguf> -p <prompt>    generate text\n"
                         "  devices                         list Vulkan devices and the features this engine uses\n"
                         "  compare <model.gguf>            check the GPU engine against the CPU reference\n"

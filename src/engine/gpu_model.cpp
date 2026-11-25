@@ -20,7 +20,8 @@ struct PcDnPrep { uint32_t n_norm, kw; float eps; };
 constexpr uint32_t k_ctl_header = 16;  // bytes before the rotation table
 }  // namespace
 
-GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16) : dev_(dev), g_(g), d_(desc), n_ctx_(n_ctx), force_fp16_(force_fp16) {
+GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16, bool kv8) : dev_(dev), g_(g), d_(desc), n_ctx_(n_ctx), force_fp16_(force_fp16), kv8_(kv8) {
+    if (kv8_ && d_.head_dim % 32) throw std::runtime_error("the 8-bit cache needs a head size that is a multiple of 32");
     if (d_.head_dim > 256) throw std::runtime_error("attention heads wider than 256 are not supported");
     dummy_ = dev_.alloc(256); dev_.fill_zero(dummy_);
     ctl_ = dev_.alloc_host(k_ctl_header + 4ull * std::max(d_.rope_dim, 2));
@@ -53,10 +54,11 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx,
                 dequantize(ld.k_norm->type, ld.k_norm->data, both.data() + d_.head_dim, d_.head_dim);
                 l.qk_norm = dev_.alloc(both.size() * 4); dev_.upload(l.qk_norm, both.data(), both.size() * 4);
             }
-            uint64_t bytes = 2ull * n_ctx_ * kv_row;
+            uint64_t bytes = (kv8_ ? 1ull : 2ull) * n_ctx_ * kv_row;
             if (bytes > dev_.caps().max_storage_range) throw std::runtime_error("context too large for this device's buffer limit");
             l.kc = dev_.alloc(bytes); l.vc = dev_.alloc(bytes);
             state_bytes_ += 2 * bytes;
+            if (kv8_) { uint64_t sb = 2ull * n_ctx_ * kv_row / 32; l.ks = dev_.alloc(sb); l.vs = dev_.alloc(sb); state_bytes_ += 2 * sb; }
         }
     }
     output_norm_ = load_vector(d_.output_norm);
@@ -165,8 +167,8 @@ void GpuModel::build_program() {
     if (C > 0) { mixed = scratch(C); z = scratch((uint64_t)HV * S); alpha = scratch(HV); beta = scratch(HV); qkv = scratch(C); dn_o = scratch((uint64_t)HV * S); dn_on = scratch_vec(HV * S); }
     Buffer logits = scratch(d_.n_vocab);
 
-    const Pipeline *p_norm = dev_.pipeline("norm"), *p_swiglu = dev_.pipeline("swiglu"), *p_attn = dev_.pipeline("attn");
-    const Pipeline *p_prep = dev_.pipeline("attn_prep", {(uint32_t)hd});
+    const Pipeline *p_norm = dev_.pipeline("norm"), *p_swiglu = dev_.pipeline("swiglu"), *p_attn = dev_.pipeline(kv8_ ? "attn_kv8" : "attn");
+    const Pipeline *p_prep = dev_.pipeline(kv8_ ? "attn_prep_kv8" : "attn_prep", {(uint32_t)hd});
     const Pipeline *p_dn_prep = C > 0 ? dev_.pipeline("dn_prep", {(uint32_t)S}) : nullptr;
     const Pipeline *p_dn_update = C > 0 ? dev_.pipeline("dn_update", {(uint32_t)S}) : nullptr;
 
@@ -192,9 +194,13 @@ void GpuModel::build_program() {
             matvec(p, l.wq, h, qfull); matvec(p, l.wk, h, kraw); matvec(p, l.wv, h, vraw);
             PcAttnPrep pp{(uint32_t)hd, (uint32_t)nh, (uint32_t)nkv, (uint32_t)qw, (uint32_t)d_.rope_dim,
                           (l.has_qk_norm ? 1u : 0u) | (d_.q_has_gate ? 2u : 0u) | (d_.rope_half_split ? 4u : 0u), d_.norm_eps};
-            p.dispatch(p_prep, {R(qfull), R(kraw), R(vraw), R(l.has_qk_norm ? l.qk_norm : dummy_), R(ctl_), W(q), W(gate), W(l.kc), W(l.vc)}, &pp, sizeof pp, std::max(nh, nkv));
+            std::vector<Binding> pb{R(qfull), R(kraw), R(vraw), R(l.has_qk_norm ? l.qk_norm : dummy_), R(ctl_), W(q), W(gate), W(l.kc), W(l.vc)};
+            if (kv8_) { pb.push_back(W(l.ks)); pb.push_back(W(l.vs)); }
+            p.dispatch(p_prep, pb, &pp, sizeof pp, std::max(nh, nkv));
             PcAttn pa{(uint32_t)hd, (uint32_t)nh, (uint32_t)nkv, (uint32_t)n_ctx_, d_.q_has_gate ? 1u : 0u, 1.0f / std::sqrt((float)hd)};
-            p.dispatch(p_attn, {R(q), R(gate), R(l.kc), R(l.vc), R(ctl_), W(scores), W(mix.v)}, &pa, sizeof pa, nh);
+            std::vector<Binding> ab{R(q), R(gate), R(l.kc), R(l.vc), R(ctl_), W(scores), W(mix.v)};
+            if (kv8_) { ab.push_back(R(l.ks)); ab.push_back(R(l.vs)); }
+            p.dispatch(p_attn, ab, &pa, sizeof pa, nh);
             blocksum(p, mix);
             matvec(p, l.wo, mix, a);
         }

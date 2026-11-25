@@ -81,7 +81,7 @@ struct Cursor {
 
 GGUF::~GGUF() { if (map_) munmap((void *)map_, map_size_); }
 
-void GGUF::open(const std::string &path) {
+void GGUF::open(const std::string &path, bool allow_truncated) {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + path + ": " + strerror(errno));
     struct stat st;
@@ -152,9 +152,9 @@ void GGUF::open(const std::string &path) {
         if (!ti) throw std::runtime_error("tensor " + t.name + " has unknown type id " + std::to_string(t.type));
         if (t.nelems % ti->block_elems) throw std::runtime_error("tensor " + t.name + ": size not a multiple of the block size");
         t.nbytes = t.nelems / ti->block_elems * ti->block_bytes;
-        if (data_offset > file_size || t.offset > file_size - data_offset || t.nbytes > file_size - data_offset - t.offset)
-            throw std::runtime_error("tensor " + t.name + " extends past the end of the file (truncated download?)");
-        t.data = map_ + data_offset + t.offset;
+        bool present = data_offset <= file_size && t.offset <= file_size - data_offset && t.nbytes <= file_size - data_offset - t.offset;
+        if (!present && !allow_truncated) throw std::runtime_error("tensor " + t.name + " extends past the end of the file (truncated download?)");
+        t.data = present ? map_ + data_offset + t.offset : nullptr;
         tensor_index_[t.name] = k;
     }
 }

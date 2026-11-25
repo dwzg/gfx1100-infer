@@ -13,8 +13,17 @@ layout(binding = 3) readonly buffer BNW { float nw[]; };       // q-norm weight,
 layout(binding = 4) readonly buffer BCTL { uint pos; uint pad[3]; float rot[]; } ctl;  // rot: cos, sin per pair
 layout(binding = 5) writeonly buffer BQ { float q[]; };
 layout(binding = 6) writeonly buffer BGT { float gate[]; };
+#ifdef KV8
+// 8-bit cache: four signed bytes per word, one half-precision scale per 32 values.
+layout(binding = 7) writeonly buffer BKC { uint kc8[]; };
+layout(binding = 8) writeonly buffer BVC { uint vc8[]; };
+layout(binding = 9) writeonly buffer BKS { float16_t ks[]; };
+layout(binding = 10) writeonly buffer BVS { float16_t vs[]; };
+shared int sq[gl_WorkGroupSize.x];
+#else
 layout(binding = 7) writeonly buffer BKC { float16_t kc[]; };
 layout(binding = 8) writeonly buffer BVC { float16_t vc[]; };
+#endif
 layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint qw; uint rope_dim; uint flags; float eps; } pc;
 // flags: 1 = normalise q and k, 2 = q carries a gate, 4 = rotation pairs are (i, i + rope_dim/2)
 shared float sv[gl_WorkGroupSize.x];
@@ -42,6 +51,23 @@ float norm_rotate(float v, uint w_off) {
     return v;
 }
 
+#ifdef KV8
+// Quantise this lane's element with its 32-element block's scale. Returns the scale; the
+// quantised value is left in sq[] for all lanes.
+float quantise8(float v) {
+    uint d = gl_LocalInvocationID.x;
+    sv[d] = v;
+    barrier();
+    if ((d & 31u) == 0u) { float m = 0.0; for (uint i = 0u; i < 32u; i++) m = max(m, abs(sv[d + i])); red[d >> 5] = m; }
+    barrier();
+    float sc = float(float16_t(red[d >> 5] / 127.0));    // the scale as it will be stored
+    sq[d] = sc > 0.0 ? int(clamp(round(v / sc), -127.0, 127.0)) : 0;
+    barrier();
+    return sc;
+}
+uint packed4(uint d) { return uint(sq[d] & 255) | (uint(sq[d + 1u] & 255) << 8) | (uint(sq[d + 2u] & 255) << 16) | (uint(sq[d + 3u]) << 24); }
+#endif
+
 void main() {
     uint g = gl_WorkGroupID.x, d = gl_LocalInvocationID.x;
     bool has_q = g < pc.nh, has_kv = g < pc.nkv;
@@ -53,9 +79,19 @@ void main() {
     }
     float kv = has_kv ? kraw[g * pc.hd + d] : 0.0;
     kv = norm_rotate(kv, pc.hd);
+    uint row = ctl.pos * pc.nkv * pc.hd + g * pc.hd + d;
+#ifdef KV8
+    float ksc = quantise8(kv);
+    if (has_kv && (d & 3u) == 0u) kc8[row >> 2] = packed4(d);
+    if (has_kv && (d & 31u) == 0u) ks[row >> 5] = float16_t(ksc);
+    barrier();
+    float vsc = quantise8(has_kv ? vraw[g * pc.hd + d] : 0.0);
+    if (has_kv && (d & 3u) == 0u) vc8[row >> 2] = packed4(d);
+    if (has_kv && (d & 31u) == 0u) vs[row >> 5] = float16_t(vsc);
+#else
     if (has_kv) {
-        uint row = ctl.pos * pc.nkv * pc.hd + g * pc.hd + d;
         kc[row] = float16_t(kv);
         vc[row] = float16_t(vraw[g * pc.hd + d]);
     }
+#endif
 }

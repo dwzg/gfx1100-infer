@@ -13,7 +13,9 @@ namespace gfx {
 class GpuModel {
   public:
     // force_fp16: store every matrix as half-precision rows (the simple baseline path, for testing).
-    GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16 = false);
+    // kv8: keep the key/value cache as 8-bit integers with a scale per 32 values (about half the
+    //      memory and memory traffic of the half-precision cache, at a small accuracy cost).
+    GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16 = false, bool kv8 = false);
     ~GpuModel();
 
     void reset();
@@ -42,6 +44,7 @@ class GpuModel {
         Buffer attn_norm, ffn_norm, qk_norm;
         Matrix wq, wk, wv, wo, wqkv, wz, wbeta, walpha, ssm_out, ffn_gate, ffn_up, ffn_down;
         Buffer kc, vc;                    // key / value cache
+        Buffer ks, vs;                    // per-block scales (8-bit cache only)
         Buffer conv_w, dt, a, ssm_norm, state, hist;
         bool has_qk_norm = false;
     };
@@ -58,7 +61,7 @@ class GpuModel {
     const GGUF &g_;
     ModelDesc d_;
     int n_ctx_, n_past_ = 0;
-    bool force_fp16_ = false;
+    bool force_fp16_ = false, kv8_ = false;
     std::vector<Layer> layers_;
     Buffer output_norm_;
     Matrix output_;
