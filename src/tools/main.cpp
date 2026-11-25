@@ -106,12 +106,13 @@ static int cmd_plan(int argc, char **argv) {
     long max16 = (long)(freeb / kv16), max8 = (long)(freeb / kv8);
     auto capped = [&](long v) { return d.n_ctx_train > 0 && v > d.n_ctx_train ? d.n_ctx_train : v; };
     printf("context that fits  %ld tokens (half-precision cache), %ld tokens (8-bit cache); the model was trained for %d\n", capped(max16), capped(max8), d.n_ctx_train);
+    if (d.n_ctx_train > 0 && max8 > d.n_ctx_train) printf("                   (memory alone would allow %ld / %ld; the trained limit caps it)\n", max16, max8);
     if (ctx > 0) printf("at %ld tokens      cache %.2f GiB half precision / %.2f GiB 8-bit -> %s\n", ctx, ctx * (double)kv16 / GiB, ctx * (double)kv8 / GiB,
                         ctx <= max16 ? "fits either way" : ctx <= max8 ? "fits with the 8-bit cache only" : "does not fit");
     // Bytes the GPU must read per generated token: all weights once, plus the cache once.
     double per_tok = (double)weights + (double)rec * 2;
     printf("memory read per token  %.2f GiB of weights and state, plus the filled cache (%.1f KiB per token of context)\n", per_tok / GiB, kv16 / 1024.0);
-    for (long c : {4096L, 32768L, 131072L})
+    for (long c : {4096L, 32768L, 131072L, 262144L})
         if (c <= max8) printf("  bandwidth ceiling at %6ld tokens of context: %5.1f tok/s (half-precision cache), %5.1f tok/s (8-bit), for 960 GB/s\n", c,
                               960e9 / (per_tok + (double)c * kv16), 960e9 / (per_tok + (double)c * kv8));
     return 0;
