@@ -15,7 +15,7 @@ ggufs=("$MODELS"/*/*.gguf)
 
 # 1. Weight decoders against the gguf Python package (optional: needs `pip install gguf numpy`).
 if "$PY" -c "import gguf, numpy" 2>/dev/null; then
-  raw=(); for t in 11 20 21 23 40; do [ -f "$MODELS/samples/q_$t.bin" ] && raw+=(--raw "$t:$MODELS/samples/q_$t.bin"); done
+  raw=(); for t in 10 11 20 21 23 40; do [ -f "$MODELS/samples/q_$t.bin" ] && raw+=(--raw "$t:$MODELS/samples/q_$t.bin"); done
   run "$PY" "$(dirname "$0")/test_quant.py" "$GFXI" "${raw[@]}" "${ggufs[@]}"
 else echo "--- skipping decoder test (python packages gguf, numpy not installed)"; fi
 
