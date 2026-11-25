@@ -12,7 +12,8 @@ namespace gfx {
 
 class GpuModel {
   public:
-    GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx);
+    // force_fp16: store every matrix as half-precision rows (the simple baseline path, for testing).
+    GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16 = false);
     ~GpuModel();
 
     void reset();
@@ -29,10 +30,13 @@ class GpuModel {
   private:
     struct Matrix {
         uint32_t n_in = 0, n_out = 0;
+        const struct PackFormat *fmt = nullptr;  // native quantised layout, or nullptr for fp16 rows
         std::vector<Buffer> chunks;       // consecutive row ranges
-        std::vector<uint32_t> chunk_rows;
+        std::vector<uint32_t> chunk_rows; // rows in each chunk (its plane stride is rows rounded up to 64)
         Buffer bias;                      // fp32, optional
     };
+    // An activation vector that feeds matrix products, with its 16-column block sums.
+    struct Vec { Buffer v, s; uint32_t n = 0; };
     struct Layer {
         bool recurrent = false;
         Buffer attn_norm, ffn_norm, qk_norm;
@@ -44,7 +48,9 @@ class GpuModel {
     Matrix load_matrix(const TensorInfo *w, const TensorInfo *bias = nullptr);
     Buffer load_vector(const TensorInfo *t);
     Buffer scratch(uint64_t n_floats);
-    void matvec(Program &p, const Matrix &m, const Buffer &x, const Buffer &y);
+    Vec scratch_vec(uint32_t n);
+    void blocksum(Program &p, const Vec &x);
+    void matvec(Program &p, const Matrix &m, const Vec &x, const Buffer &y);
     void build_program();
     void eval_one(int32_t token);
 
@@ -52,6 +58,7 @@ class GpuModel {
     const GGUF &g_;
     ModelDesc d_;
     int n_ctx_, n_past_ = 0;
+    bool force_fp16_ = false;
     std::vector<Layer> layers_;
     Buffer output_norm_;
     Matrix output_;

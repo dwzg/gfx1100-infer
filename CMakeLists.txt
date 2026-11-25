@@ -29,6 +29,11 @@ target_link_libraries(gfxcore PUBLIC Threads::Threads)
 find_package(Vulkan REQUIRED)
 include(cmake/shaders.cmake)
 gfx_shader(matvec_f16 matvec_f16.comp)
+foreach(fmt Q4_K Q5_K Q6_K Q3_K IQ4_XS IQ4_NL Q4_0 Q8_0 NVFP4)
+  string(TOLOWER ${fmt} fmt_lower)
+  gfx_shader(matvec_${fmt_lower} matvec_q.comp FMT_${fmt})
+endforeach()
+gfx_shader(blocksum blocksum.comp)
 gfx_shader(norm norm.comp)
 gfx_shader(swiglu swiglu.comp)
 gfx_shader(attn_prep attn_prep.comp)
@@ -39,6 +44,7 @@ gfx_shaders_finish()
 
 add_library(gfxgpu STATIC
   src/engine/gpu_model.cpp
+  src/engine/pack.cpp
   src/vk/vk.cpp
   src/vk/shaders.cpp)
 target_link_libraries(gfxgpu PUBLIC gfxcore gfxshaders Vulkan::Vulkan)

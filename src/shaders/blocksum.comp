@@ -1,0 +1,16 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// xs[b] = sum of x over columns [16b, 16b + 16). The quantised matvec kernels use these sums to
+// apply per-block offsets without touching them in the inner loop.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer BX { float x[]; };
+layout(binding = 1) writeonly buffer BXS { float xs[]; };
+layout(push_constant) uniform PC { uint n_blocks; } pc;
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.n_blocks) return;
+    float s0 = 0.0, s1 = 0.0;
+    for (uint i = 0u; i < 16u; i += 2u) { s0 += x[16u * b + i]; s1 += x[16u * b + i + 1u]; }
+    xs[b] = s0 + s1;
+}

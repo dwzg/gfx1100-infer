@@ -188,7 +188,7 @@ static int cmd_run(int argc, char **argv) {
 // Run the GPU engine and the CPU reference on the same tokens and report how closely they agree.
 static int cmd_compare(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "usage: gfxi compare <model.gguf> [-p prompt] [-n extra tokens] [--device name] [--tol T]\n"); return 2; }
-    std::string prompt = "The quick brown fox jumps over the lazy dog. In 1969, humans first", device; int n_extra = 8; double tol = 0.05;
+    std::string prompt = "The quick brown fox jumps over the lazy dog. In 1969, humans first", device; int n_extra = 8; double tol = 0.05; bool fp16 = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
@@ -196,6 +196,7 @@ static int cmd_compare(int argc, char **argv) {
         else if (a == "-n") n_extra = atoi(next());
         else if (a == "--device") device = next();
         else if (a == "--tol") tol = atof(next());
+        else if (a == "--fp16") fp16 = true;
         else throw std::runtime_error("unknown option " + a);
     }
     GGUF g; g.open(argv[0]);
@@ -204,7 +205,8 @@ static int cmd_compare(int argc, char **argv) {
     std::vector<int32_t> ids = tok.encode(prompt, true, true);
     int n_ctx = (int)ids.size() + n_extra + 1;
     Device dev(device);
-    GpuModel gpu(dev, g, desc, n_ctx);
+    GpuModel gpu(dev, g, desc, n_ctx, fp16);
+    printf("weights on device: %.3f GiB\n", gpu.weight_bytes() / 1073741824.0);
     RefModel ref(g, desc, n_ctx, (int)std::thread::hardware_concurrency());
     printf("device %s, model %s, %zu prompt tokens + %d generated\n", dev.caps().name.c_str(), desc.name.c_str(), ids.size(), n_extra);
     double worst = 0; int mismatches = 0, steps = 0;

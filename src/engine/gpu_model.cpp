@@ -6,11 +6,13 @@
 #include <stdexcept>
 
 #include "core/quant.h"
+#include "pack.h"
 
 namespace gfx {
 
 namespace {
 struct PcMatvec { uint32_t n_in, n_rows, row0, flags; };
+struct PcMatvecQ { uint32_t n_sb, stride, n_rows, row0, flags; };
 struct PcNorm { uint32_t n, flags; float eps; };
 struct PcAttnPrep { uint32_t hd, nh, nkv, qw, rope_dim, flags; float eps; };
 struct PcAttn { uint32_t hd, nh, nkv, n_ctx, flags; float scale; };
@@ -18,7 +20,7 @@ struct PcDnPrep { uint32_t n_norm, kw; float eps; };
 constexpr uint32_t k_ctl_header = 16;  // bytes before the rotation table
 }  // namespace
 
-GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx) : dev_(dev), g_(g), d_(desc), n_ctx_(n_ctx) {
+GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16) : dev_(dev), g_(g), d_(desc), n_ctx_(n_ctx), force_fp16_(force_fp16) {
     if (d_.head_dim > 256) throw std::runtime_error("attention heads wider than 256 are not supported");
     dummy_ = dev_.alloc(256); dev_.fill_zero(dummy_);
     ctl_ = dev_.alloc_host(k_ctl_header + 4ull * std::max(d_.rope_dim, 2));
@@ -78,29 +80,49 @@ Buffer GpuModel::load_vector(const TensorInfo *t) {
     return b;
 }
 
-// Phase-A weight path: every matrix is stored in half precision, split into row chunks that fit
-// the device's storage-binding limit.
+// Upload a matrix. Encodings with a native layout keep their exact bits (see pack.h); anything else
+// is stored as half-precision rows. Either way the matrix is split into row chunks that fit the
+// device's storage-binding limit.
 GpuModel::Matrix GpuModel::load_matrix(const TensorInfo *w, const TensorInfo *bias) {
     Matrix m; m.n_in = (uint32_t)w->dim(0); m.n_out = (uint32_t)w->dim(1);
     const TypeInfo *ti = type_info(w->type);
     if (m.n_in % ti->block_elems) throw std::runtime_error("tensor " + w->name + ": rows are not block aligned");
-    uint64_t row_bytes = 2ull * m.n_in, limit = std::min<uint64_t>(dev_.caps().max_storage_range, 1ull << 30);
-    uint32_t rows_per_chunk = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(m.n_out, limit / row_bytes));
-    uint64_t src_row_bytes = (uint64_t)m.n_in / ti->block_elems * ti->block_bytes;
-    std::vector<float> f(m.n_in);
-    std::vector<uint16_t> hbuf;
-    for (uint32_t r0 = 0; r0 < m.n_out; r0 += rows_per_chunk) {
-        uint32_t rows = std::min(rows_per_chunk, m.n_out - r0);
-        hbuf.resize((size_t)rows * m.n_in);
-        for (uint32_t r = 0; r < rows; r++) {
-            if (!dequantize(w->type, w->data + (uint64_t)(r0 + r) * src_row_bytes, f.data(), m.n_in)) throw std::runtime_error("no decoder for tensor " + w->name);
-            uint16_t *o = &hbuf[(size_t)r * m.n_in];
-            for (uint32_t i = 0; i < m.n_in; i++) o[i] = fp32_to_fp16(f[i]);
+    const uint64_t limit = std::min<uint64_t>(dev_.caps().max_storage_range, 1ull << 30);
+    m.fmt = force_fp16_ ? nullptr : pack_format(w->type);
+    if (m.fmt && m.n_in % m.fmt->sb_cols) m.fmt = nullptr;
+    if (m.fmt) {
+        const uint64_t words_per_row = (uint64_t)(m.n_in / m.fmt->sb_cols) * m.fmt->sb_words;
+        uint64_t max_rows = limit / (words_per_row * 4) / 64 * 64;
+        if (max_rows == 0) throw std::runtime_error("tensor " + w->name + " is too wide for this device's buffer limit");
+        std::vector<uint32_t> buf;
+        for (uint32_t r0 = 0; r0 < m.n_out;) {
+            uint32_t rows = (uint32_t)std::min<uint64_t>(max_rows, m.n_out - r0), stride = (rows + 63) / 64 * 64;
+            buf.resize(words_per_row * stride);
+            pack_rows(*m.fmt, w->data, m.n_in, r0, rows, stride, buf.data());
+            Buffer b = dev_.alloc(buf.size() * 4);
+            dev_.upload(b, buf.data(), buf.size() * 4);
+            m.chunks.push_back(b); m.chunk_rows.push_back(rows);
+            weight_bytes_ += b.size; r0 += rows;
         }
-        Buffer b = dev_.alloc(hbuf.size() * 2);
-        dev_.upload(b, hbuf.data(), hbuf.size() * 2);
-        m.chunks.push_back(b); m.chunk_rows.push_back(rows);
-        weight_bytes_ += b.size;
+    } else {
+        uint64_t row_bytes = 2ull * m.n_in;
+        uint32_t rows_per_chunk = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(m.n_out, limit / row_bytes));
+        uint64_t src_row_bytes = (uint64_t)m.n_in / ti->block_elems * ti->block_bytes;
+        std::vector<float> f(m.n_in);
+        std::vector<uint16_t> hbuf;
+        for (uint32_t r0 = 0; r0 < m.n_out; r0 += rows_per_chunk) {
+            uint32_t rows = std::min(rows_per_chunk, m.n_out - r0);
+            hbuf.resize((size_t)rows * m.n_in);
+            for (uint32_t r = 0; r < rows; r++) {
+                if (!dequantize(w->type, w->data + (uint64_t)(r0 + r) * src_row_bytes, f.data(), m.n_in)) throw std::runtime_error("no decoder for tensor " + w->name);
+                uint16_t *o = &hbuf[(size_t)r * m.n_in];
+                for (uint32_t i = 0; i < m.n_in; i++) o[i] = fp32_to_fp16(f[i]);
+            }
+            Buffer b = dev_.alloc(hbuf.size() * 2);
+            dev_.upload(b, hbuf.data(), hbuf.size() * 2);
+            m.chunks.push_back(b); m.chunk_rows.push_back(rows);
+            weight_bytes_ += b.size;
+        }
     }
     if (bias) m.bias = load_vector(bias);
     return m;
@@ -108,24 +130,39 @@ GpuModel::Matrix GpuModel::load_matrix(const TensorInfo *w, const TensorInfo *bi
 
 Buffer GpuModel::scratch(uint64_t n_floats) { Buffer b = dev_.alloc(n_floats * 4); dev_.fill_zero(b); return b; }
 
-void GpuModel::matvec(Program &p, const Matrix &m, const Buffer &x, const Buffer &y) {
-    const Pipeline *pl = dev_.pipeline("matvec_f16");
-    uint32_t row0 = 0;
+GpuModel::Vec GpuModel::scratch_vec(uint32_t n) { return Vec{scratch(n), scratch((n + 15) / 16), n}; }
+
+void GpuModel::blocksum(Program &p, const Vec &x) {
+    uint32_t nb = (x.n + 15) / 16;
+    p.dispatch(dev_.pipeline("blocksum"), {R(x.v), W(x.s)}, &nb, sizeof nb, (nb + 63) / 64);
+}
+
+void GpuModel::matvec(Program &p, const Matrix &m, const Vec &x, const Buffer &y) {
+    const Buffer &bias = m.bias.valid() ? m.bias : dummy_;
+    uint32_t row0 = 0, flags = m.bias.valid() ? 1u : 0u;
     for (size_t c = 0; c < m.chunks.size(); c++) {
-        PcMatvec pc{m.n_in, m.chunk_rows[c], row0, m.bias.valid() ? 1u : 0u};
-        p.dispatch(pl, {R(m.chunks[c]), R(x), W(y), R(m.bias.valid() ? m.bias : dummy_)}, &pc, sizeof pc, (m.chunk_rows[c] + 63) / 64);
-        row0 += m.chunk_rows[c];
+        uint32_t rows = m.chunk_rows[c];
+        if (m.fmt) {
+            uint32_t stride = (rows + 63) / 64 * 64;
+            PcMatvecQ pc{m.n_in / m.fmt->sb_cols, stride, rows, row0, flags};
+            p.dispatch(dev_.pipeline(m.fmt->kernel), {R(m.chunks[c]), R(x.v), R(x.s), W(y), R(bias)}, &pc, sizeof pc, stride / 64);
+        } else {
+            PcMatvec pc{m.n_in, rows, row0, flags};
+            p.dispatch(dev_.pipeline("matvec_f16"), {R(m.chunks[c]), R(x.v), W(y), R(bias)}, &pc, sizeof pc, (rows + 63) / 64);
+        }
+        row0 += rows;
     }
 }
 
 void GpuModel::build_program() {
     const int n = d_.n_embd, hd = d_.head_dim, nh = d_.n_head, nkv = d_.n_head_kv, qw = d_.q_has_gate ? 2 * hd : hd;
     const int S = d_.dn_head_dim, HK = d_.dn_k_heads, HV = d_.dn_v_heads, C = d_.dn_conv_dim();
-    Buffer x = scratch(n), h = scratch(n), a = scratch(n), g = scratch(d_.n_ff), u = scratch(d_.n_ff), act = scratch(d_.n_ff);
+    Buffer x = scratch(n), a = scratch(n), g = scratch(d_.n_ff), u = scratch(d_.n_ff);
+    Vec h = scratch_vec(n), act = scratch_vec(d_.n_ff), mix = scratch_vec(nh * hd), dn_on;
     Buffer qfull = scratch((uint64_t)nh * qw), kraw = scratch((uint64_t)nkv * hd), vraw = scratch((uint64_t)nkv * hd);
-    Buffer q = scratch((uint64_t)nh * hd), gate = scratch((uint64_t)nh * hd), mix = scratch((uint64_t)nh * hd), scores = scratch((uint64_t)nh * n_ctx_);
-    Buffer mixed, z, alpha, beta, qkv, dn_o, dn_on;
-    if (C > 0) { mixed = scratch(C); z = scratch((uint64_t)HV * S); alpha = scratch(HV); beta = scratch(HV); qkv = scratch(C); dn_o = scratch((uint64_t)HV * S); dn_on = scratch((uint64_t)HV * S); }
+    Buffer q = scratch((uint64_t)nh * hd), gate = scratch((uint64_t)nh * hd), scores = scratch((uint64_t)nh * n_ctx_);
+    Buffer mixed, z, alpha, beta, qkv, dn_o;
+    if (C > 0) { mixed = scratch(C); z = scratch((uint64_t)HV * S); alpha = scratch(HV); beta = scratch(HV); qkv = scratch(C); dn_o = scratch((uint64_t)HV * S); dn_on = scratch_vec(HV * S); }
     Buffer logits = scratch(d_.n_vocab);
 
     const Pipeline *p_norm = dev_.pipeline("norm"), *p_swiglu = dev_.pipeline("swiglu"), *p_attn = dev_.pipeline("attn");
@@ -142,14 +179,14 @@ void GpuModel::build_program() {
     };
     for (int il = 0; il < d_.n_layer; il++) {
         Layer &l = layers_[il];
-        norm(x, il > 0 ? a : Buffer{}, l.attn_norm, Buffer{}, h, n, 1);
+        norm(x, il > 0 ? a : Buffer{}, l.attn_norm, Buffer{}, h.v, n, 1); blocksum(p, h);
         if (l.recurrent) {
             matvec(p, l.wqkv, h, mixed); matvec(p, l.wz, h, z); matvec(p, l.wbeta, h, beta); matvec(p, l.walpha, h, alpha);
             PcDnPrep pp{(uint32_t)(2 * HK), (uint32_t)d_.dn_conv, d_.norm_eps};
             p.dispatch(p_dn_prep, {R(mixed), W(l.hist), R(l.conv_w), W(qkv)}, &pp, sizeof pp, C / S);
             uint32_t hk = HK;
             p.dispatch(p_dn_update, {R(qkv), R(alpha), R(beta), R(l.dt), R(l.a), W(l.state), W(dn_o)}, &hk, sizeof hk, HV);
-            norm(dn_o, Buffer{}, l.ssm_norm, z, dn_on, S, HV);
+            norm(dn_o, Buffer{}, l.ssm_norm, z, dn_on.v, S, HV); blocksum(p, dn_on);
             matvec(p, l.ssm_out, dn_on, a);
         } else {
             matvec(p, l.wq, h, qfull); matvec(p, l.wk, h, kraw); matvec(p, l.wv, h, vraw);
@@ -157,16 +194,18 @@ void GpuModel::build_program() {
                           (l.has_qk_norm ? 1u : 0u) | (d_.q_has_gate ? 2u : 0u) | (d_.rope_half_split ? 4u : 0u), d_.norm_eps};
             p.dispatch(p_prep, {R(qfull), R(kraw), R(vraw), R(l.has_qk_norm ? l.qk_norm : dummy_), R(ctl_), W(q), W(gate), W(l.kc), W(l.vc)}, &pp, sizeof pp, std::max(nh, nkv));
             PcAttn pa{(uint32_t)hd, (uint32_t)nh, (uint32_t)nkv, (uint32_t)n_ctx_, d_.q_has_gate ? 1u : 0u, 1.0f / std::sqrt((float)hd)};
-            p.dispatch(p_attn, {R(q), R(gate), R(l.kc), R(l.vc), R(ctl_), W(scores), W(mix)}, &pa, sizeof pa, nh);
+            p.dispatch(p_attn, {R(q), R(gate), R(l.kc), R(l.vc), R(ctl_), W(scores), W(mix.v)}, &pa, sizeof pa, nh);
+            blocksum(p, mix);
             matvec(p, l.wo, mix, a);
         }
-        norm(x, a, l.ffn_norm, Buffer{}, h, n, 1);
+        norm(x, a, l.ffn_norm, Buffer{}, h.v, n, 1); blocksum(p, h);
         matvec(p, l.ffn_gate, h, g); matvec(p, l.ffn_up, h, u);
         uint32_t nff = d_.n_ff;
-        p.dispatch(p_swiglu, {R(g), R(u), W(act)}, &nff, sizeof nff, (nff + 63) / 64);
+        p.dispatch(p_swiglu, {R(g), R(u), W(act.v)}, &nff, sizeof nff, (nff + 63) / 64);
+        blocksum(p, act);
         matvec(p, l.ffn_down, act, a);
     }
-    norm(x, a, output_norm_, Buffer{}, h, n, 1);
+    norm(x, a, output_norm_, Buffer{}, h.v, n, 1); blocksum(p, h);
     matvec(p, output_, h, logits);
     p.copy(logits, logits_host_);
     p.finish();
