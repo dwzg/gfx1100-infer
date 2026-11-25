@@ -253,6 +253,7 @@ What was checked, and how:
 | Server protocol: streaming, forced tool call, tool result, reuse across turns and across a side request, cancel, stop sequence, errors | Official `anthropic` Python SDK 2.14 as the client | All pass; a follow-up turn reused 432 of 432 earlier tokens |
 | Inkling 2 Mini, CPU reference | The text it writes | Coherent reasoning and a correct answer ("Capital of France is Paris ... `s[::-1]`") |
 | Inkling 2 Mini, GPU engine: token by token, prompts in batches of 8, 8-bit cache, and a start at position 9,000 (ring wrap-around, distances past the bias table, position scaling) | Its CPU reference | Relative logit error 7e-5 (half precision), 4e-4 at position 9,000, 1.8e-2 (8-bit); same top token throughout |
+| Conversation cache with the Inkling engine: continuing, a side request branching off, returning, a second conversation with the same beginning | Processing the same tokens from scratch | Bit-identical logits |
 | Inkling prompt formatting (32 prompts) and reply parsing (6 cases at every piece size) | Its own template run with jinja2; expected blocks | Byte-identical; all pass |
 | Claude Code itself: CLI 2.1.332 with its default system prompt and 13 tools (12,453 prompt tokens), asked to read a file and report a value from it; Qwen 3.5 0.8B on the CPU driver | The right answer | Called its Read tool, then answered correctly; the second request reused 12,558 of 12,587 prompt tokens |
 

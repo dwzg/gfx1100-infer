@@ -503,6 +503,92 @@ static int cmd_compare(int argc, char **argv) {
     return ok ? 0 : 1;
 }
 
+// The conversation cache with an Inkling model: short conversations that continue, branch and
+// return, each checked against processing the same tokens from scratch on a second engine. The
+// CPU reference runs first to pick the tokens and to tell which experts must be on the device.
+static int test_context_inkling(const GGUF &g, const std::string &device, bool kv8, double tol) {
+    InklingDesc idesc = describe_inkling(g);
+    Tokenizer tok(g);
+    auto enc = [&](const std::string &t) { return tok.encode(t, false, true); };
+    const std::string sys = "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|>";
+    const std::string a1 = sys + "<|message_user|><|content_text|>Name a prime number.<|end_message|>";
+    const std::string reply = "<|message_model|><|content_text|>Seven.<|end_message|><|content_model_end_sampling|>";
+    const std::string a2 = a1 + reply + "<|message_user|><|content_text|>And another one?<|end_message|>";
+    const std::string side = a1 + reply + "<|message_user|><|content_text|>Give this chat a short title.<|end_message|>";
+    const std::string b1 = sys + "<|message_user|><|content_text|>Say hello in French.<|end_message|>";
+    struct Step { const char *what; std::vector<int32_t> prompt; int n_push; int min_reuse; std::vector<int32_t> pushed; };
+    const int sys_n = (int)enc(sys).size(), a1_n = (int)enc(a1).size();
+    std::vector<Step> steps = {
+        {"first conversation", enc(a1), 2, 0, {}},
+        {"its next turn", enc(a2), 1, sys_n, {}},
+        {"side request branching off the first turn", enc(side), 1, a1_n, {}},
+        {"the conversation continues without the side request", enc(a2), 1, a1_n, {}},
+        {"second conversation with the same beginning", enc(b1), 1, sys_n, {}},
+        {"back to the first conversation", enc(a2), 0, a1_n, {}},
+    };
+    size_t longest = 0;
+    for (auto &st : steps) longest = std::max(longest, st.prompt.size() + st.n_push);
+    const int n_ctx = (int)longest + 8;
+    std::vector<std::vector<bool>> used(idesc.n_layer, std::vector<bool>(idesc.n_expert, false));
+    {
+        InklingRef ref(g, idesc, n_ctx, (int)std::thread::hardware_concurrency());
+        auto note = [&] { for (int sl = 0; sl < idesc.n_slots(); sl++) for (int e : ref.last_experts()[sl]) used[idesc.slot_layer(sl)][e] = true; };
+        for (auto &st : steps) {
+            ref.reset();
+            const std::vector<float> *l = nullptr;
+            for (int32_t t : st.prompt) { l = &ref.eval(&t, 1); note(); }
+            for (int i = 0; i < st.n_push; i++) {
+                int32_t t = (int32_t)(std::max_element(l->begin(), l->end()) - l->begin());
+                st.pushed.push_back(t);
+                l = &ref.eval(&t, 1); note();
+            }
+        }
+    }
+    printf("reference done\n"); fflush(stdout);
+    Device dev(device);
+    setenv("GFX_PAGE", "64", 0);
+    auto want = [&](int layer, int e) { return (bool)used[layer][e]; };
+    size_t n_used = 0;
+    for (auto &l : used) for (bool x : l) n_used += x;
+    printf("%zu of %d expert slots are needed on the device\n", n_used, idesc.n_layer * idesc.n_expert); fflush(stdout);
+    // One engine (two would not fit this test's machine): first every step from scratch, then
+    // the same steps through the conversation cache.
+    GpuModel gpu(dev, g, idesc, 192, kv8, 256ull << 20, 8, true, want);
+    std::vector<std::vector<std::vector<float>>> scratch_logits(steps.size());
+    for (size_t i = 0; i < steps.size(); i++) {
+        gpu.reset();
+        scratch_logits[i].push_back(gpu.eval(steps[i].prompt.data(), (int)steps[i].prompt.size()));
+        for (int32_t t : steps[i].pushed) scratch_logits[i].push_back(gpu.eval(&t, 1));
+    }
+    ContextCache::Options opt; opt.min_gap = 6; opt.leave_gap = 6; opt.max_checkpoints = 3; opt.max_conversations = 4;
+    ContextCache cc(gpu, opt);
+    printf("model %s on %s, %s cache, %d pages of %d positions, %.0f MiB of state per checkpoint\n", idesc.name.c_str(), dev.caps().name.c_str(), kv8 ? "8-bit" : "half-precision", gpu.pages_total(),
+           gpu.page_size(), gpu.state_size() / 1048576.0);
+    int failed = 0;
+    for (size_t i = 0; i < steps.size(); i++) {
+        Step &st = steps[i];
+        ContextCache::Result r = cc.prepare(st.prompt, {sys_n});
+        double worst = 0;
+        auto compare = [&](const std::vector<float> &got, const std::vector<float> &ref_l) {
+            double num = 0, den = 0;
+            for (size_t k = 0; k < ref_l.size(); k++) { double d = (double)got[k] - ref_l[k]; num += d * d; den += (double)ref_l[k] * ref_l[k]; }
+            worst = std::max(worst, std::sqrt(num / std::max(den, 1e-30)));
+        };
+        compare(cc.logits(), scratch_logits[i][0]);
+        for (size_t k = 0; k < st.pushed.size(); k++) {
+            if (!cc.push(st.pushed[k])) throw std::runtime_error("push failed");
+            compare(cc.logits(), scratch_logits[i][k + 1]);
+        }
+        const bool ok = worst <= tol && r.reused >= st.min_reuse && r.reused + r.evaluated == (int)st.prompt.size();
+        printf("  %-52s %4zu tokens, %4d reused, %4d processed, error %.1e  %s   [%s, %d checkpoints]\n", st.what, st.prompt.size(), r.reused, r.evaluated, worst, ok ? "ok" : "FAILED",
+               cc.summary().c_str(), cc.checkpoints());
+        fflush(stdout);
+        failed += !ok;
+    }
+    printf("%s\n", failed ? "FAIL" : "PASS");
+    return failed ? 1 : 0;
+}
+
 // Conversation cache self-test: a series of prompts that continue, branch off, return to and
 // crowd out each other, each checked against processing the same prompt from scratch.
 static int cmd_test_context(int argc, char **argv) {
@@ -518,6 +604,7 @@ static int cmd_test_context(int argc, char **argv) {
         else throw std::runtime_error("unknown option " + a);
     }
     GGUF g; g.open(argv[0]);
+    if (is_inkling(g)) return test_context_inkling(g, device, kv8, tol);
     ModelDesc desc = describe_model(g);
     Tokenizer tok(g);
     Device dev(device);
