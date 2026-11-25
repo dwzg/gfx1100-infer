@@ -17,6 +17,7 @@ find_package(Threads REQUIRED)
 add_library(gfxcore STATIC
   src/core/chat.cpp
   src/core/gguf.cpp
+  src/core/inkling.cpp
   src/core/json.cpp
   src/core/model.cpp
   src/core/quant.cpp

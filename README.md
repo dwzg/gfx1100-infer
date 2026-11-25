@@ -22,7 +22,7 @@ Nothing in this repository is a measured 7900 XTX speed.
 | Tokenizer | Byte-pair vocabularies with the `qwen35`, `qwen2`, `llama3`, `inkling2`/`gpt-4o`, `smollm`, `gpt-2` rules |
 | Attention cache | Half precision, or 8-bit with `--kv8`; context sized automatically with `--ctx max` |
 | Saving and restoring a processed context | `--save-state` / `--load-state` |
-| Inkling 2 Mini (`inkling2_loop`) | **Not yet.** Its weight format and tokenizer are supported; its model graph is not |
+| Inkling 2 Mini (`inkling2_loop`) | **CPU reference only** (`--device cpu`, about 1.5 s per token): the whole graph is implemented and writes coherent text. No GPU path yet |
 | Batched prompt processing | Yes: prompt tokens go through in batches (default 32) with weights decoded once per 4-token tile |
 | Matrix instructions (WMMA) for prompts | Written and compiled for the card, **never executed**; enabled per weight format only if an automatic on-device check passes |
 | Interactive chat | `gfxi chat`, ChatML-style templates only, with `--system` and `--no-think` |
@@ -117,6 +117,9 @@ are ignored unless `--client-sampling`), `--host`, `--port`, `--api-key`, `--mod
 Limits to know about:
 
 - One request generates at a time; others wait their turn (they are kept alive with pings).
+- Claude Code gives up on a request that has produced nothing after ten minutes (`API_TIMEOUT_MS`)
+  and sends it again. The server keeps what it had processed, so the retry continues from there
+  (seen in the test run on the CPU driver, where the first prompt took twenty minutes).
 - The context is shared by all conversations the server keeps, which is why the window given to
   Claude Code above is smaller than the server's context.
 - Qwen 3.5 and later mix attention with linear-attention layers, whose state cannot be rewound.
@@ -227,6 +230,7 @@ What was checked, and how:
 | Prompt formatting: 86 prompts with system text, tools, calls, results, reasoning and effort levels, on the templates of Qwen 3.8, 3.5, 3, 2.5 and SmolLM2 | The model's own template, run with jinja2 | Byte-identical |
 | Reply parser: 14 replies, each fed in pieces of 1, 2, 3, 7, 64 bytes and whole | Expected blocks; events add up to the blocks; parsed and written back gives the original text | All pass |
 | Server protocol: streaming, forced tool call, tool result, reuse across turns and across a side request, cancel, stop sequence, errors | Official `anthropic` Python SDK 2.14 as the client | All pass; a follow-up turn reused 432 of 432 earlier tokens |
+| Claude Code itself: CLI 2.1.332 with its default system prompt and 13 tools (12,453 prompt tokens), asked to read a file and report a value from it; Qwen 3.5 0.8B on the CPU driver | The right answer | Called its Read tool, then answered correctly; the second request reused 12,558 of 12,587 prompt tokens |
 
 Not checked:
 

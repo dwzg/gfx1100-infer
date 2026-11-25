@@ -16,6 +16,7 @@
 
 #include "core/chat.h"
 #include "core/gguf.h"
+#include "core/inkling.h"
 #include "core/model.h"
 #include "core/quant.h"
 #include "core/ref.h"
@@ -214,9 +215,16 @@ static int cmd_run(int argc, char **argv) {
     }
     if ((!save_path.empty() || !load_path.empty()) && device == "cpu") throw std::runtime_error("saved contexts need the GPU path");
     GGUF g; g.open(argv[0]);
-    ModelDesc desc = describe_model(g);
+    const bool inkling = is_inkling(g);
+    ModelDesc desc; InklingDesc idesc;
+    if (inkling) { idesc = describe_inkling(g); desc.name = idesc.name; } else desc = describe_model(g);
+    if (inkling && device != "cpu") throw std::runtime_error("Inkling 2 models only run on the reference CPU path so far: add --device cpu");
     Tokenizer tok(g);
-    if (chat) {
+    if (chat && inkling) {
+        // Inkling's own message format: a system note sets the thinking effort, the model opens its reply itself.
+        prompt = (system_prompt.empty() ? "" : "<|message_system|><|content_text|>" + system_prompt + "<|end_message|>") +
+                 "<|message_system|><|content_text|>Thinking effort level: " + (think ? "0.9" : "0") + "<|end_message|><|message_user|><|content_text|>" + prompt + "<|end_message|>";
+    } else if (chat) {
         ChatFormat cf = detect_chat_format(g);
         if (!cf.supported) throw std::runtime_error("this model's chat template (" + cf.name + ") is not supported; pass the full prompt with -p instead");
         prompt = (system_prompt.empty() ? "" : cf.message("system", system_prompt)) + cf.message("user", prompt) + cf.reply_start(think);
@@ -226,9 +234,14 @@ static int cmd_run(int argc, char **argv) {
     if (ids.empty() && load_path.empty()) throw std::runtime_error("the prompt is empty");
     if (n_ctx <= 0 && !load_path.empty()) ctx_max = true;
     if (n_ctx <= 0) n_ctx = (int)ids.size() + n_predict + 1;
-    std::unique_ptr<RefModel> ref; std::unique_ptr<Device> dev; std::unique_ptr<GpuModel> gpu;
+    std::unique_ptr<RefModel> ref; std::unique_ptr<InklingRef> iref; std::unique_ptr<Device> dev; std::unique_ptr<GpuModel> gpu;
     std::function<const std::vector<float> &(const int32_t *, int)> eval;
-    if (device == "cpu") {
+    if (inkling) {
+        fprintf(stderr, "[reference CPU path] %s: %d layers in %d cache slots (%d attend to everything), %d of %d experts per token, %d prompt tokens\n", idesc.name.c_str(), idesc.n_layer,
+                idesc.n_slots(), idesc.n_full_slots(), idesc.n_expert_used, idesc.n_expert, (int)ids.size());
+        iref = std::make_unique<InklingRef>(g, idesc, n_ctx, threads);
+        eval = [&](const int32_t *t, int n) -> const std::vector<float> & { return iref->eval(t, n); };
+    } else if (device == "cpu") {
         fprintf(stderr, "[reference CPU path] %s: %d layers (%d full attention), %d prompt tokens\n", desc.name.c_str(), desc.n_layer, desc.n_attn_layers(), (int)ids.size());
         ref = std::make_unique<RefModel>(g, desc, n_ctx, threads);
         eval = [&](const int32_t *t, int n) -> const std::vector<float> & { return ref->eval(t, n); };
