@@ -3,6 +3,9 @@
 // Attention over the depth (Inkling): up to five residual streams of a token are normalised and
 // combined with softmax weights from a learned query. One workgroup per (query, token).
 //   out[q][t] = sum_s p_s * s_hat_s,   s_hat = s / rms(s),   p = softmax_s(s_hat_s . query_q / sqrt(n))
+// With flag 1 the result is RMS-normalised and scaled by w[q] right away, and its sums over
+// blocks of 16 elements are written for the matrix products that follow. Each lane handles
+// whole 16-element blocks.
 #include "common.glsl"
 layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer B0 { float s0[]; };
@@ -12,17 +15,21 @@ layout(binding = 3) readonly buffer B3 { float s3[]; };
 layout(binding = 4) readonly buffer B4 { float s4[]; };
 layout(binding = 5) readonly buffer BQ { float query[]; };   // [query][n]
 layout(binding = 6) writeonly buffer BO { float o[]; };      // [query][token slot][n]
-layout(push_constant) uniform PC { uint n; uint n_states; uint out_stride; } pc;   // out_stride: elements per query in the output
+layout(binding = 7) readonly buffer BW { float w[]; };       // [query][n]
+layout(binding = 8) writeonly buffer BS { float sums[]; };   // [query][token slot][n / 16]
+layout(push_constant) uniform PC { uint n; uint n_states; uint out_stride; uint flags; float eps; } pc;   // out_stride: elements per query in the output
 shared float red[10][256];
 shared float wgt[5];
 
 float state(uint s, uint i) { return s == 0u ? s0[i] : s == 1u ? s1[i] : s == 2u ? s2[i] : s == 3u ? s3[i] : s4[i]; }
+float mixed(uint i) { float v = 0.0; for (uint s = 0u; s < pc.n_states; s++) v += wgt[s] * state(s, i); return v; }
+#define FOR_MINE for (uint b = 16u * lid; b < pc.n; b += 4096u) for (uint i = b; i < min(b + 16u, pc.n); i++)
 
 void main() {
     uint lid = gl_LocalInvocationID.x, q = gl_WorkGroupID.x, t = gl_WorkGroupID.y, base = t * pc.n;
     for (uint s = 0u; s < pc.n_states; s++) {
         float ss = 0.0, dq = 0.0;
-        for (uint i = lid; i < pc.n; i += 256u) { float v = state(s, base + i); ss += v * v; dq += v * query[q * pc.n + i]; }
+        FOR_MINE { float v = state(s, base + i); ss += v * v; dq += v * query[q * pc.n + i]; }
         red[2u * s][lid] = ss; red[2u * s + 1u][lid] = dq;
     }
     barrier();
@@ -43,9 +50,26 @@ void main() {
         for (uint s = 0u; s < pc.n_states; s++) wgt[s] *= sc[s] / sum;   // weight times 1/rms
     }
     barrier();
-    for (uint i = lid; i < pc.n; i += 256u) {
-        float v = 0.0;
-        for (uint s = 0u; s < pc.n_states; s++) v += wgt[s] * state(s, base + i);
-        o[q * pc.out_stride + base + i] = v;
+    if ((pc.flags & 1u) == 0u) {
+        FOR_MINE o[q * pc.out_stride + base + i] = mixed(base + i);
+        return;
+    }
+    float ss = 0.0;
+    FOR_MINE { float v = mixed(base + i); ss += v * v; }
+    red[0][lid] = ss;
+    barrier();
+    for (uint h = 128u; h > 0u; h >>= 1u) {
+        if (lid < h) red[0][lid] += red[0][lid + h];
+        barrier();
+    }
+    float scale = inversesqrt(red[0][0] / float(pc.n) + pc.eps);
+    for (uint b = 16u * lid; b < pc.n; b += 4096u) {
+        float bsum = 0.0;
+        for (uint i = b; i < min(b + 16u, pc.n); i++) {
+            float v = mixed(base + i) * scale * w[q * pc.n + i];
+            o[q * pc.out_stride + base + i] = v;
+            bsum += v;
+        }
+        sums[(q * pc.out_stride + base + b) >> 4] = bsum;
     }
 }

@@ -15,17 +15,17 @@ namespace gfx {
 namespace {
 struct PcNorm { uint32_t n, flags; float eps; };
 struct PcMv32 { uint32_t n_in, n_rows, x_stride, y_stride; };
-struct PcMix { uint32_t n, n_states, out_stride; };
-struct PcConv { uint32_t n_ch, nc, n_tokens, x_stride, flags, per_head, taps_stride; };
-struct PcPrep { uint32_t hd, nh, nkv, nr, flags; float qk_clip, rel_clip, eps; uint32_t stride, page_shift, ring; };
-struct PcTable { uint32_t nr, extent, nh; };
+struct PcMix { uint32_t n, n_states, out_stride, flags; float eps; };
+struct PcCtlLow { uint32_t n, rank; };
+struct PcCtlOut { uint32_t n, rank, flags; float eps; };
+struct PcConv { uint32_t n_ch, nc, n_tokens, x_stride, flags, per_head, taps_stride, used; };
+struct PcPrep { uint32_t hd, nh, nkv, nr, flags; float qk_clip, rel_clip, eps; uint32_t stride, page_shift, ring, extent; };
 struct PcScore { uint32_t hd, stride, n_ctx; float scale; uint32_t nh, tq0, page_shift, extent, ring, window, n_batch; };
 struct PcSoft { uint32_t n_ctx, nh, tq0; };
 struct PcVsum { uint32_t hd, nh, nkv, n_ctx, seg, part_stride, tq0; };
 struct PcCombine { uint32_t hd, nh, seg, flags, part_stride, tq0, n_seg; };
-struct PcRoute { uint32_t n_expert, used; float scale; uint32_t flags; };
+struct PcRoute { uint32_t n_expert, used; float scale; uint32_t flags, n; };
 struct PcSitu { uint32_t nff; float beta, lb; };
-struct PcEsum { uint32_t n, used, flags; };
 struct PcExpert { uint32_t n_sb, stride, n_rows, row0, flags, used, x_stride, xs_stride; };
 constexpr uint32_t k_ring_seg = 256;   // places of a sliding-window cache summed per workgroup
 }  // namespace
@@ -36,7 +36,7 @@ struct GpuModel::Ink {
         bool window = false;
         Matrix wq, wk, wv, wo, wgate, rel;
         Buffer sink, k_taps, v_taps, q_clip, rel_clip, rel_bias, k_conv, v_conv, attn_conv, ffn_conv;
-        Buffer attn_norm, q_norm, k_norm, v_norm, attn_query, ffn_query, ffn_norm, router, router_bias;
+        Buffer attn_norms, attn_query, ffn_query, ffn_norm, router, router_bias;   // attn_norms: one norm weight per mixed input (q, k, v for full layers)
         Buffer gate_up, down, gate_up_scale, down_scale;   // all experts of the layer, one after another
         const PackFormat *gu_fmt = nullptr, *dn_fmt = nullptr;
         Buffer msg_query, ctrl_down[4], ctrl_gain[4], ctrl_forget[4];
@@ -51,9 +51,9 @@ struct GpuModel::Ink {
     Matrix output;
     uint32_t ring = 0, ring_segs = 0, table_stride = 0;
     // activations (B = batch capacity)
-    Buffer xraw, x, cur, blk[5], pass_out[2], m, msg, ci, cl, cg, cf, in[3], qraw, kraw, vraw, rraw, sink, gate, ktaps, vtaps, q, r, table, scores, zsum, part;
-    Buffer a, f, fc, rl, ids, wts, gu, act, acts, dn, ff, logits;
-    Vec h[3], hf, mix, h_last;
+    Buffer xraw, x, cur, blk[5], pass_out[2], m, ms, msg, low[4], qraw, kraw, vraw, rraw, sink, gate, ktaps, vtaps, q, table, scores, zsum, part;
+    Buffer a, f, ids, wts, gu, act, acts, dn, logits;
+    Vec h[3], hf, mix, h_last;   // m/ms: the mixed attention inputs, normalised, with their block sums; h[j]: the same as vectors (and after the controllers)
 };
 
 GpuModel::~GpuModel() = default;
@@ -104,9 +104,13 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const InklingDesc &desc, int n_ct
         l.wq = load_matrix(ld.wq); l.wk = load_matrix(ld.wk); l.wv = load_matrix(ld.wv); l.wo = load_matrix(ld.wo); l.wgate = load_matrix(ld.wgate); l.rel = load_matrix(ld.rel);
         l.sink = load_vector(ld.sink); l.q_clip = load_vector(ld.q_clip); l.rel_clip = load_vector(ld.rel_clip); l.rel_bias = load_vector(ld.rel_bias);
         l.k_conv = load_vector(ld.k_conv); l.v_conv = load_vector(ld.v_conv); l.attn_conv = load_vector(ld.attn_conv); l.ffn_conv = load_vector(ld.ffn_conv);
-        if (ld.window) l.attn_norm = load_vector(ld.attn_norm);
+        if (ld.window) l.attn_norms = load_vector(ld.attn_norm);
         else {
-            l.q_norm = load_vector(ld.q_norm); l.k_norm = load_vector(ld.k_norm); l.v_norm = load_vector(ld.v_norm);
+            // The three input norms one after another, as the mixing kernel indexes them by query.
+            std::vector<float> w(3 * (size_t)n);
+            const TensorInfo *parts[3] = {ld.q_norm, ld.k_norm, ld.v_norm};
+            for (int j = 0; j < 3; j++) if (!dequantize(parts[j]->type, parts[j]->data, w.data() + (size_t)j * n, n)) throw std::runtime_error("no decoder for tensor " + parts[j]->name);
+            l.attn_norms = dev_.alloc(w.size() * 4); dev_.upload(l.attn_norms, w.data(), w.size() * 4); weight_bytes_ += l.attn_norms.size;
             l.k_taps = load_vector(ld.k_taps); l.v_taps = load_vector(ld.v_taps);
         }
         if (ld.attn_query) l.attn_query = load_vector(ld.attn_query);
@@ -148,13 +152,13 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const InklingDesc &desc, int n_ct
     k.xraw = scratch(B * n); k.x = scratch(B * n); k.cur = scratch(B * n);
     for (Buffer &b : k.blk) b = scratch(B * n);
     for (Buffer &b : k.pass_out) b = scratch(B * n);
-    k.m = scratch(3 * B * n); k.msg = scratch(4 * B * n); k.ci = scratch(B * 2 * n); k.cl = scratch(B * D.gate_rank + 64); k.cg = scratch(B * n); k.cf = scratch(B * n);
-    for (Buffer &b : k.in) b = scratch(B * n);
+    k.m = scratch(3 * B * n); k.ms = scratch(3 * B * n / 16); k.msg = scratch(4 * B * n);
+    for (Buffer &b : k.low) b = scratch(B * D.gate_rank + 64);
     for (Vec &v : k.h) v = scratch_vec(B * n);
     k.hf = scratch_vec(B * n); k.mix = scratch_vec(B * HQ); k.h_last = scratch_vec(n);
     k.qraw = scratch(B * HQ); k.kraw = scratch(B * HK); k.vraw = scratch(B * HK); k.rraw = scratch(B * RN); k.sink = scratch(B * D.n_head); k.gate = scratch(B * HQ);
     k.ktaps = scratch(B * D.n_conv * D.n_head_kv); k.vtaps = scratch(B * D.n_conv * D.n_head_kv);
-    k.q = scratch(B * HQ); k.r = scratch(B * RN); k.table = scratch(B * D.n_head * k.table_stride); k.zsum = scratch(B * D.n_head);
+    k.q = scratch(B * HQ); k.table = scratch(B * D.n_head * k.table_stride); k.zsum = scratch(B * D.n_head);
     uint64_t budget = k_scores_budget;
     if (const char *e = getenv("GFX_SCORES_BUDGET")) budget = strtoull(e, nullptr, 10);   // testing aid
     const uint64_t per_query = 4ull * D.n_head * std::max<uint64_t>(stride_, k.ring), limit = std::min<uint64_t>(budget, dev_.caps().max_storage_range);
@@ -163,8 +167,8 @@ GpuModel::GpuModel(Device &dev, const GGUF &g, const InklingDesc &desc, int n_ct
     k.scores = dev_.alloc(per_query * q_batch_);
     k.part = dev_.alloc(4ull * part_stride_ * q_batch_);
     const uint64_t U = D.n_expert_used;
-    k.a = scratch(B * n); k.f = scratch(B * n); k.fc = scratch(B * n); k.rl = scratch(B * ne); k.ids = scratch(B * U); k.wts = scratch(B * U);
-    k.gu = scratch(B * U * 2 * nff); k.act = scratch(B * U * nff); k.acts = scratch(B * U * nff / 16); k.dn = scratch(B * U * n); k.ff = scratch(B * n);
+    k.a = scratch(B * n); k.f = scratch(B * n); k.ids = scratch(B * U); k.wts = scratch(B * U);
+    k.gu = scratch(B * U * 2 * nff); k.act = scratch(B * U * nff); k.acts = scratch(B * U * nff / 16); k.dn = scratch(B * U * n);
     k.logits = scratch(D.n_vocab_padded);
     if (wmma_) verify_wmma();
     finish_init();
@@ -182,9 +186,8 @@ void GpuModel::record_inkling(Program &p, uint32_t N) {
     const bool halves = wmma_ && !wmma_ok_.empty() && N >= k_wmma_min_tokens;
     const uint64_t n16 = (N + k_wmma_tile - 1) / k_wmma_tile * k_wmma_tile;
 
-    const Pipeline *p_norm = dev_.pipeline("norm"), *p_mv32 = dev_.pipeline("matvec_f32"), *p_mix = dev_.pipeline("ink_mix"), *p_ctl_in = dev_.pipeline("ink_ctl_in"),
-                   *p_ctl_out = dev_.pipeline("ink_ctl_out"), *p_conv = dev_.pipeline("ink_conv"), *p_table = dev_.pipeline("ink_table"), *p_route = dev_.pipeline("ink_route"),
-                   *p_situ = dev_.pipeline("ink_situ"), *p_esum = dev_.pipeline("ink_esum");
+    const Pipeline *p_norm = dev_.pipeline("norm"), *p_mv32 = dev_.pipeline("matvec_f32"), *p_mix = dev_.pipeline("ink_mix"), *p_ctl_low = dev_.pipeline("ink_ctl_low"),
+                   *p_ctl_out = dev_.pipeline("ink_ctl_out"), *p_conv = dev_.pipeline("ink_conv"), *p_route = dev_.pipeline("ink_route"), *p_situ = dev_.pipeline("ink_situ");
     const Pipeline *p_prep = dev_.pipeline(kv8_ ? "ink_prep_kv8" : "ink_prep", {hd});
     const Pipeline *p_score = dev_.pipeline(kv8_ ? "ink_score_kv8" : "ink_score", {G}), *p_wscore = dev_.pipeline(kv8_ ? "ink_wscore_kv8" : "ink_wscore", {G});
     const Pipeline *p_soft = dev_.pipeline("ink_soft"), *p_wsoft = dev_.pipeline("ink_wsoft");
@@ -192,42 +195,38 @@ void GpuModel::record_inkling(Program &p, uint32_t N) {
     const Pipeline *p_vsum = dev_.pipeline(kv8_ ? "attn_vsum_kv8" : "attn_vsum", {vwords, G}), *p_wvsum = dev_.pipeline(kv8_ ? "ink_wvsum_kv8" : "ink_wvsum", {vwords, G});
     const Pipeline *p_combine = dev_.pipeline("attn_combine", {hd});
 
-    // y = rms_norm(x) * w for N vectors of n elements, with block sums when a matrix product follows.
-    auto norm = [&](const Buffer &x, const Buffer &w, const Vec &y, uint32_t count) {
-        PcNorm pc{n, 4u, D.norm_eps};
-        p.dispatch(p_norm, {R(x), R(dummy_), R(w), R(dummy_), W(y.v), W(y.s)}, &pc, sizeof pc, count);
-        if (halves && count > 1) to_half(p, y, n16 * n);
-    };
+    // The steps of a layer are fused so that few of them have to wait for one another: every
+    // dispatch that reads what an earlier one wrote costs a synchronisation point.
+    auto half = [&](const Vec &y) { if (halves) to_half(p, y, n16 * n); };
     auto mv32 = [&](const Buffer &w, uint32_t n_in, uint32_t rows, const Buffer &x, uint32_t xs, const Buffer &y, uint32_t ys) {
         PcMv32 pc{n_in, rows, xs, ys};
         p.dispatch(p_mv32, {R(w), R(x), W(y)}, &pc, sizeof pc, (rows + 63) / 64, N);
     };
-    // Depth mixing: out[q][token] for nq queries (out holds B vectors per query).
-    auto mix = [&](const std::vector<Buffer> &states, const Buffer &query, uint32_t nq, const Buffer &out) {
+    // Depth mixing for nq queries: out[q][token] (B vectors per query). With `norm`, the result
+    // is normalised with weight norm[q] and its block sums go to `sums`.
+    auto mix = [&](const std::vector<Buffer> &states, const Buffer &query, uint32_t nq, const Buffer &out, const Buffer *norm, const Buffer *sums) {
         if (states.size() > 5) throw std::runtime_error("internal: too many residual streams to mix");
         std::vector<Binding> b;
         for (size_t i = 0; i < 5; i++) b.push_back(R(i < states.size() ? states[i] : dummy_));
-        b.push_back(R(query)); b.push_back(W(out));
-        PcMix pc{n, (uint32_t)states.size(), B * n};
+        b.push_back(R(query)); b.push_back(W(out)); b.push_back(R(norm ? *norm : dummy_)); b.push_back(W(sums ? *sums : dummy_));
+        PcMix pc{n, (uint32_t)states.size(), B * n, norm ? 1u : 0u, D.norm_eps};
         p.dispatch(p_mix, b, &pc, sizeof pc, nq, N);
     };
-    // Message controller c of a looped layer: out = (1 - forget) * cur + gain * message.
-    auto control = [&](const Buffer &cur, const Buffer &message, const Ink::Layer &l, int c, const Buffer &out) {
-        uint32_t pn = n;
-        p.dispatch(p_ctl_in, {R(cur), R(message), W(k.ci)}, &pn, sizeof pn, N);
-        mv32(l.ctrl_down[c], 2 * n, rank, k.ci, 2 * n, k.cl, rank);
-        mv32(l.ctrl_gain[c], rank, n, k.cl, rank, k.cg, n);
-        mv32(l.ctrl_forget[c], rank, n, k.cl, rank, k.cf, n);
-        uint32_t count = N * n;
-        p.dispatch(p_ctl_out, {R(cur), R(message), R(k.cg), R(k.cf), W(out)}, &count, sizeof count, (count + 63) / 64);
+    // Message controller c of a looped layer, in two steps: its low-rank gate, then
+    // out = norm((1 - forget) * cur + gain * message) with block sums.
+    auto control_low = [&](const Buffer &cur, const Buffer &message, const Ink::Layer &l, int c) {
+        PcCtlLow pc{n, rank};
+        p.dispatch(p_ctl_low, {R(cur), R(message), R(l.ctrl_down[c]), W(k.low[c])}, &pc, sizeof pc, N);
     };
-    auto conv = [&](const Buffer &x, uint32_t channels, const Buffer &w, const Ink::Slot &sl, uint32_t offset, const Buffer *taps, uint32_t heads) {
-        PcConv pc{channels, nc, N, channels, taps ? 1u : 0u, channels / heads, nc * heads};
-        p.dispatch(p_conv, {W(x), R(w), W(sl.hist.sub(4ull * offset * (nc - 1), 4ull * channels * (nc - 1))), R(taps ? *taps : dummy_)}, &pc, sizeof pc, (channels + 63) / 64);
+    auto control_out = [&](const Buffer &cur, const Buffer &message, const Ink::Layer &l, int c, const Buffer &norm, const Vec &out) {
+        PcCtlOut pc{n, rank, 1u, D.norm_eps};
+        p.dispatch(p_ctl_out, {R(cur), R(message), R(k.low[c]), R(l.ctrl_gain[c]), R(l.ctrl_forget[c]), W(out.v), R(norm), W(out.s)}, &pc, sizeof pc, N);
     };
-    auto add = [&](const Buffer &a, const Buffer &b, const Buffer &y) {
-        PcEsum pc{N * n, 0, 1u};
-        p.dispatch(p_esum, {R(a), R(b), W(y)}, &pc, sizeof pc, (N * n + 63) / 64);
+    // Convolution over the slot's history at channel `offset`; see the kernel for the flags.
+    auto conv = [&](const Buffer &x, const Buffer &out, uint32_t channels, const Buffer &w, const Ink::Slot &sl, uint32_t offset, const Buffer *taps, uint32_t heads, const Buffer *base, bool experts) {
+        PcConv pc{channels, nc, N, channels, (taps ? 1u : 0u) | (base ? 2u : 0u) | (experts ? 4u : 0u), channels / heads, nc * heads, U};
+        p.dispatch(p_conv, {R(x), R(w), W(sl.hist.sub(4ull * offset * (nc - 1), 4ull * channels * (nc - 1))), R(taps ? *taps : dummy_), R(base ? *base : dummy_), R(experts ? k.wts : dummy_), W(out)},
+                   &pc, sizeof pc, (channels + 63) / 64);
     };
 
     // One layer in cache slot `slot`. x: the stream (updated in place). blocks: the inputs of the
@@ -238,33 +237,43 @@ void GpuModel::record_inkling(Program &p, uint32_t N) {
         std::vector<Buffer> states = blocks;
         states.push_back(k.x);
 
-        // Inputs of the query, key and value projections.
+        // Normalised inputs of the query, key and value projections: one for the layers with a
+        // sliding window (unless messages make them differ), three for the others.
         const uint32_t nq = l.window ? 1 : 3;
-        Buffer inp[3] = {k.x, k.x, k.x};
-        if (l.attn_query.valid()) {
-            mix(states, l.attn_query, nq, k.m);
-            for (int j = 0; j < 3; j++) inp[j] = k.m.sub((l.window ? 0 : j) * vec, vec);
+        Vec hin[3];
+        if (!l.attn_query.valid()) {
+            // The first layer has nothing to mix.
+            PcNorm pc{n, 4u, D.norm_eps};
+            p.dispatch(p_norm, {R(k.x), R(dummy_), R(l.attn_norms), R(dummy_), W(k.h[0].v), W(k.h[0].s)}, &pc, sizeof pc, N);
+            hin[0] = hin[1] = hin[2] = k.h[0];
+            half(k.h[0]);
+        } else if (!messages) {
+            mix(states, l.attn_query, nq, k.m, &l.attn_norms, &k.ms);
+            for (int j = 0; j < 3; j++) {
+                const uint64_t q = l.window ? 0 : j;
+                hin[j] = Vec{k.m.sub(q * vec, vec), k.ms.sub(q * vec / 16, vec / 16), k.h[q].h, 0};
+            }
+            for (uint32_t q = 0; q < nq; q++) half(hin[q]);
+        } else {
+            mix(states, l.attn_query, nq, k.m, nullptr, nullptr);
+            for (int j = 0; j < 3; j++) control_low(k.m.sub((l.window ? 0 : j) * vec, vec), messages->sub(j * vec, vec), l, j);
+            for (int j = 0; j < 3; j++) {
+                control_out(k.m.sub((l.window ? 0 : j) * vec, vec), messages->sub(j * vec, vec), l, j, l.attn_norms.sub(l.window ? 0 : 4ull * j * n, 4ull * n), k.h[j]);
+                hin[j] = k.h[j];
+            }
+            for (int j = 0; j < 3; j++) half(k.h[j]);
         }
-        if (messages) for (int j = 0; j < 3; j++) { control(inp[j], messages->sub(j * vec, vec), l, j, k.in[j]); inp[j] = k.in[j]; }
-        const Vec *hq = &k.h[0], *hk = &k.h[0], *hv = &k.h[0];
-        if (l.window && !messages) norm(inp[0], l.attn_norm, k.h[0], N);
-        else {
-            norm(inp[0], l.window ? l.attn_norm : l.q_norm, k.h[0], N);
-            norm(inp[1], l.window ? l.attn_norm : l.k_norm, k.h[1], N);
-            norm(inp[2], l.window ? l.attn_norm : l.v_norm, k.h[2], N);
-            hk = &k.h[1]; hv = &k.h[2];
-        }
-        matmul(p, l.wq, *hq, k.qraw, N); matmul(p, l.wk, *hk, k.kraw, N); matmul(p, l.wv, *hv, k.vraw, N);
-        matmul(p, l.rel, *hq, k.rraw, N); matmul(p, l.wgate, *hq, k.gate, N);
-        mv32(l.sink, n, nh, hq->v, n, k.sink, nh);
-        if (!l.window) { mv32(l.k_taps, n, nc * nkv, hk->v, n, k.ktaps, nc * nkv); mv32(l.v_taps, n, nc * nkv, hv->v, n, k.vtaps, nc * nkv); }
-        conv(k.kraw, HK, l.k_conv, sl, 0, l.window ? nullptr : &k.ktaps, nkv);
-        conv(k.vraw, HK, l.v_conv, sl, HK, l.window ? nullptr : &k.vtaps, nkv);
+        const Vec &hq = hin[0], &hk = hin[1], &hv = hin[2];
+        matmul(p, l.wq, hq, k.qraw, N); matmul(p, l.wk, hk, k.kraw, N); matmul(p, l.wv, hv, k.vraw, N);
+        matmul(p, l.rel, hq, k.rraw, N); matmul(p, l.wgate, hq, k.gate, N);
+        mv32(l.sink, n, nh, hq.v, n, k.sink, nh);
+        if (!l.window) { mv32(l.k_taps, n, nc * nkv, hk.v, n, k.ktaps, nc * nkv); mv32(l.v_taps, n, nc * nkv, hv.v, n, k.vtaps, nc * nkv); }
+        conv(k.kraw, k.kraw, HK, l.k_conv, sl, 0, l.window ? nullptr : &k.ktaps, nkv, nullptr, false);
+        conv(k.vraw, k.vraw, HK, l.v_conv, sl, HK, l.window ? nullptr : &k.vtaps, nkv, nullptr, false);
 
-        PcPrep pp{hd, nh, nkv, nr, (l.window ? 2u : 1u), D.qk_clip, D.rel_clip, D.norm_eps, l.window ? k.ring : stride_, page_shift_, k.ring};
-        p.dispatch(p_prep, {R(k.qraw), R(k.kraw), R(k.vraw), R(k.rraw), R(l.q_clip), R(l.rel_clip), R(ctl_), W(k.q), W(k.r), W(sl.kc), W(sl.vc), R(pt_)}, &pp, sizeof pp, std::max(nh, nkv), N);
-        PcTable pt{nr, l.extent, nh};
-        p.dispatch(p_table, {R(l.rel_bias), R(k.r), R(k.sink), W(k.table)}, &pt, sizeof pt, (l.extent + 1 + 63) / 64, nh, N);
+        PcPrep pp{hd, nh, nkv, nr, (l.window ? 2u : 1u), D.qk_clip, D.rel_clip, D.norm_eps, l.window ? k.ring : stride_, page_shift_, k.ring, l.extent};
+        p.dispatch(p_prep, {R(k.qraw), R(k.kraw), R(k.vraw), R(k.rraw), R(l.q_clip), R(l.rel_clip), R(ctl_), W(k.q), W(k.table), W(sl.kc), W(sl.vc), R(pt_), R(l.rel_bias), R(k.sink)}, &pp, sizeof pp,
+                   std::max(nh, nkv), N);
 
         // All keys and values of the batch are cached now; each query attends up to its own position.
         const float scale = 1.0f / std::sqrt((float)hd);
@@ -292,25 +301,26 @@ void GpuModel::record_inkling(Program &p, uint32_t N) {
         }
         if (halves) to_half(p, k.mix, n16 * HQ);
         matmul(p, l.wo, k.mix, k.a, N);
-        conv(k.a, n, l.attn_conv, sl, 2 * HK, nullptr, 1);
 
-        // The first layer of a block starts a new residual stream; its input joins the mixed streams.
+        // The first layer of a block starts a new residual stream (its input joins the mixed
+        // streams); the others add to the stream they got.
         if (ip % D.block == 0) {
             p.copy(k.x.sub(0, 4ull * N * n), block_store.sub(0, 4ull * N * n));
             blocks.push_back(block_store);
-            p.copy(k.a.sub(0, 4ull * N * n), k.cur.sub(0, 4ull * N * n));
-        } else add(k.x, k.a, k.cur);
+            conv(k.a, k.cur, n, l.attn_conv, sl, 2 * HK, nullptr, 1, nullptr, false);
+        } else conv(k.a, k.cur, n, l.attn_conv, sl, 2 * HK, nullptr, 1, &k.x, false);
 
         // Mixture of experts.
         states = blocks;
         states.push_back(k.cur);
-        mix(states, l.ffn_query, 1, k.f);
-        const Buffer *fin = &k.f;
-        if (messages) { control(k.f, messages->sub(3 * vec, vec), l, 3, k.fc); fin = &k.fc; }
-        norm(*fin, l.ffn_norm, k.hf, N);
-        mv32(l.router, n, ne, k.hf.v, n, k.rl, ne);
-        PcRoute pr{ne, U, D.expert_scale, l.router_bias.valid() ? 1u : 0u};
-        p.dispatch(p_route, {R(k.rl), R(l.router_bias.valid() ? l.router_bias : dummy_), W(k.ids), W(k.wts)}, &pr, sizeof pr, N);
+        if (!messages) mix(states, l.ffn_query, 1, k.hf.v, &l.ffn_norm, &k.hf.s);
+        else {
+            mix(states, l.ffn_query, 1, k.f, nullptr, nullptr);
+            control_low(k.f, messages->sub(3 * vec, vec), l, 3);
+            control_out(k.f, messages->sub(3 * vec, vec), l, 3, l.ffn_norm, k.hf);
+        }
+        PcRoute pr{ne, U, D.expert_scale, l.router_bias.valid() ? 1u : 0u, n};
+        p.dispatch(p_route, {R(k.hf.v), R(l.router), R(l.router_bias.valid() ? l.router_bias : dummy_), W(k.ids), W(k.wts)}, &pr, sizeof pr, N);
         {
             const uint32_t rows = 2 * nff, stride = (rows + 63) / 64 * 64;
             PcExpert pe{n / l.gu_fmt->sb_cols, stride, rows, 0, 0, U, n, n / 16};
@@ -325,10 +335,8 @@ void GpuModel::record_inkling(Program &p, uint32_t N) {
             std::string kernel = std::string("expert") + (l.dn_fmt->kernel + 6);
             p.dispatch(dev_.pipeline(kernel), {R(l.down), R(k.act), R(k.acts), W(k.dn), R(l.down_scale), R(dummy_), R(k.ids)}, &pe, sizeof pe, stride / 64, U, N);
         }
-        PcEsum pes{n, U, 0};
-        p.dispatch(p_esum, {R(k.dn), R(k.wts), W(k.ff)}, &pes, sizeof pes, (n + 63) / 64, N);
-        conv(k.ff, n, l.ffn_conv, sl, 2 * HK + n, nullptr, 1);
-        add(k.cur, k.ff, k.x);
+        // The experts' weighted sum, its convolution and the residual, in one step.
+        conv(k.dn, k.x, n, l.ffn_conv, sl, 2 * HK + n, nullptr, 1, &k.cur, true);
     };
 
     p.copy(embd_.sub(0, 4ull * N * n), k.xraw.sub(0, 4ull * N * n));
@@ -365,7 +373,7 @@ void GpuModel::record_inkling(Program &p, uint32_t N) {
             for (int ip = start; ip < end; ip++) {
                 if (pass == 0) { layer(ip, ip, blocks, store(ip, pass), nullptr); continue; }
                 const int slot = D.n_layer + (pass - 1) * (end - start) + (ip - start);
-                mix(bank, k.layers[ip].msg_query, 4, k.msg);
+                mix(bank, k.layers[ip].msg_query, 4, k.msg, nullptr, nullptr);
                 layer(slot, ip, blocks, store(ip, pass), &k.msg);
             }
             if (pass + 1 < D.loop_count) p.copy(k.x.sub(0, 4ull * N * n), k.pass_out[pass % 2].sub(0, 4ull * N * n));
@@ -375,8 +383,11 @@ void GpuModel::record_inkling(Program &p, uint32_t N) {
     // Output: mix the streams once more; only the last token's logits are needed.
     std::vector<Buffer> states = blocks;
     states.push_back(k.x);
-    mix(states, k.output_query, 1, k.f);
-    norm(k.f.sub(4ull * (N - 1) * n, 4ull * n), k.output_norm, k.h_last, 1);
+    mix(states, k.output_query, 1, k.f, nullptr, nullptr);
+    {
+        PcNorm pc{n, 4u, D.norm_eps};
+        p.dispatch(p_norm, {R(k.f.sub(4ull * (N - 1) * n, 4ull * n)), R(dummy_), R(k.output_norm), R(dummy_), W(k.h_last.v), W(k.h_last.s)}, &pc, sizeof pc, 1);
+    }
     matmul(p, k.output, k.h_last, k.logits, 1);
     p.copy(k.logits, logits_host_);
 }

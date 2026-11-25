@@ -1,25 +1,40 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// Expert routing (Inkling), one workgroup per token: probabilities are sigmoids of the router
-// logits; the `used` experts with the largest probability plus selection bias are chosen (lower
-// index first among equals); their probabilities, normalised to sum to `scale`, weight the experts.
+// Expert routing (Inkling), one workgroup per token. One lane per expert computes its router
+// logit; then the `used` experts with the largest sigmoid(logit) + selection bias are chosen
+// (lower index first among equals), and their probabilities, normalised to sum to `scale`,
+// become the experts' weights.
 #include "common.glsl"
-layout(local_size_x = 1) in;
-layout(binding = 0) readonly buffer BL { float logits[]; };   // [token][n_expert]
-layout(binding = 1) readonly buffer BB { float bias[]; };
-layout(binding = 2) writeonly buffer BI { uint ids[]; };      // [token][used]
-layout(binding = 3) writeonly buffer BW { float wts[]; };     // [token][used]
-layout(push_constant) uniform PC { uint n_expert; uint used; float scale; uint flags; } pc;
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer BX { float x[]; };        // [token][n]
+layout(binding = 1) readonly buffer BR { float router[]; };   // [n_expert][n]
+layout(binding = 2) readonly buffer BB { float bias[]; };
+layout(binding = 3) writeonly buffer BI { uint ids[]; };      // [token][used]
+layout(binding = 4) writeonly buffer BW { float wts[]; };     // [token][used]
+layout(push_constant) uniform PC { uint n_expert; uint used; float scale; uint flags; uint n; } pc;
+shared float prob[256];
 void main() {
-    uint t = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.x, e = gl_LocalInvocationID.x;
+    if (e < pc.n_expert) {
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        uint wb = e * pc.n, xb = t * pc.n, i = 0u;
+        for (; i + 4u <= pc.n; i += 4u) {
+            a0 += router[wb + i] * x[xb + i]; a1 += router[wb + i + 1u] * x[xb + i + 1u];
+            a2 += router[wb + i + 2u] * x[xb + i + 2u]; a3 += router[wb + i + 3u] * x[xb + i + 3u];
+        }
+        for (; i < pc.n; i++) a0 += router[wb + i] * x[xb + i];
+        prob[e] = sigmoid((a0 + a1) + (a2 + a3));
+    }
+    barrier();
+    if (e != 0u) return;
     float pick[256];
-    for (uint e = 0u; e < pc.n_expert; e++) pick[e] = sigmoid(logits[t * pc.n_expert + e]) + ((pc.flags & 1u) != 0u ? bias[e] : 0.0);
-    uint chosen[32]; float p[32]; float sum = 0.0;
+    for (uint k = 0u; k < pc.n_expert; k++) pick[k] = prob[k] + ((pc.flags & 1u) != 0u ? bias[k] : 0.0);
+    uint chosen[32]; float sum = 0.0;
     for (uint k = 0u; k < pc.used; k++) {
         uint best = 0u; float bv = -3.0e38;
-        for (uint e = 0u; e < pc.n_expert; e++) if (pick[e] > bv) { bv = pick[e]; best = e; }
+        for (uint j = 0u; j < pc.n_expert; j++) if (pick[j] > bv) { bv = pick[j]; best = j; }
         pick[best] = -3.0e38;
-        chosen[k] = best; p[k] = sigmoid(logits[t * pc.n_expert + best]); sum += p[k];
+        chosen[k] = best; sum += prob[best];
     }
-    for (uint k = 0u; k < pc.used; k++) { ids[t * pc.used + k] = chosen[k]; wts[t * pc.used + k] = p[k] / (sum + 1.0e-20) * pc.scale; }
+    for (uint k = 0u; k < pc.used; k++) { ids[t * pc.used + k] = chosen[k]; wts[t * pc.used + k] = prob[chosen[k]] / (sum + 1.0e-20) * pc.scale; }
 }

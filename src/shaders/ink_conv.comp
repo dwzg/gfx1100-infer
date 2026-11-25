@@ -1,16 +1,23 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// Short causal convolution with a residual (Inkling), in place, one lane per channel:
-//   x[t] = (x[t] + sum_i w[i] * x[t - (nc-1) + i] (+ sum_lag taps[t][lag] * x[t - lag])) / sqrt((taps ? 2 : 1) * nc + 1)
-// on the values before the update. The last nc-1 inputs of each channel are kept in `hist`
-// between calls (oldest first). The tokens of a batch are walked in order.
+// Short causal convolution with a residual (Inkling), one lane per channel:
+//   y[t] = (x[t] + sum_i w[i] * x[t - (nc-1) + i] (+ sum_lag taps[t][lag] * x[t - lag])) / sqrt((taps ? 2 : 1) * nc + 1)
+// The last nc-1 inputs of each channel are kept in `hist` between calls (oldest first). The
+// tokens of a batch are walked in order. Flags:
+//   1  input-dependent taps, shared by the channels of a head
+//   2  the result is added to `base` (the residual stream)
+//   4  the input is the weighted sum of the chosen experts' outputs, x[t][k] with weights wts[t][k]
+// The output may be the input buffer.
 #include "common.glsl"
 layout(local_size_x = 64) in;
-layout(binding = 0) buffer BX { float x[]; };                 // [token][x_stride]
+layout(binding = 0) readonly buffer BX { float x[]; };        // [token][x_stride]  (flag 4: [token][used][n_ch])
 layout(binding = 1) readonly buffer BW { float w[]; };        // [channel][nc]
 layout(binding = 2) buffer BH { float hist[]; };              // [channel][nc - 1], this convolution's part
 layout(binding = 3) readonly buffer BT { float taps[]; };     // [token][head][nc]
-layout(push_constant) uniform PC { uint n_ch; uint nc; uint n_tokens; uint x_stride; uint flags; uint per_head; uint taps_stride; } pc;
+layout(binding = 4) readonly buffer BB { float base[]; };     // [token][n_ch]
+layout(binding = 5) readonly buffer BE { float wts[]; };      // [token][used]
+layout(binding = 6) writeonly buffer BO { float o[]; };       // [token][x_stride]
+layout(push_constant) uniform PC { uint n_ch; uint nc; uint n_tokens; uint x_stride; uint flags; uint per_head; uint taps_stride; uint used; } pc;
 void main() {
     uint c = gl_GlobalInvocationID.x;
     if (c >= pc.n_ch) return;
@@ -21,7 +28,11 @@ void main() {
     float norm = inversesqrt(float((dyn ? 2u : 1u) * pc.nc + 1u));
     uint head = c / pc.per_head;
     for (uint t = 0u; t < pc.n_tokens; t++) {
-        float cur = x[t * pc.x_stride + c];
+        float cur;
+        if ((pc.flags & 4u) != 0u) {
+            cur = 0.0;
+            for (uint k = 0u; k < pc.used; k++) cur += wts[t * pc.used + k] * x[(t * pc.used + k) * pc.n_ch + c];
+        } else cur = x[t * pc.x_stride + c];
         float acc = cur * w[c * pc.nc + nh];
         for (uint i = 0u; i < nh; i++) acc += h[i] * w[c * pc.nc + i];
         if (dyn) {
@@ -31,7 +42,9 @@ void main() {
         }
         for (uint i = 0u; i + 1u < nh; i++) h[i] = h[i + 1u];
         h[nh - 1u] = cur;
-        x[t * pc.x_stride + c] = (cur + acc) * norm;
+        float y = (cur + acc) * norm;
+        if ((pc.flags & 2u) != 0u) y += base[t * pc.n_ch + c];
+        o[t * pc.x_stride + c] = y;
     }
     for (uint i = 0u; i < nh; i++) hist[c * nh + i] = h[i];
 }

@@ -5,7 +5,10 @@
 //   query:    scale per element, limit the head's length to qk_clip, (full layers) times tau -> q
 //   key:      limit the head's length to qk_clip -> key cache
 //   value:    RMS-normalise the head -> value cache
-//   relative: scale per element, limit the length to rel_clip, (full layers) times tau -> r
+//   relative: scale per element, limit the length to rel_clip, (full layers) times tau; then the
+//             position bias by distance, minus the head's sink logit:
+//             table[e] = dot(bias[e], r) - sink for e < extent, and -sink for e == extent
+//             (the last entry serves every distance past the table)
 // The cache position is found through the page table, or (flag 2) is the position modulo the
 // size of a ring that only keeps a sliding window.
 #include "common.glsl"
@@ -18,16 +21,19 @@ layout(binding = 4) readonly buffer BQC { float qclip[]; };   // [head][hd]
 layout(binding = 5) readonly buffer BRC { float rclip[]; };   // [head][nr]
 layout(binding = 6) readonly buffer BCTL { uint pos; uint pad[3]; float tau[]; } ctl;   // tau: one per token, at [2 * token]
 layout(binding = 7) writeonly buffer BQ { float q[]; };
-layout(binding = 8) writeonly buffer BR { float r[]; };
+layout(binding = 8) writeonly buffer BT { float table[]; };   // [token][head][extent + 1]
 layout(binding = 9) writeonly buffer BKC { uint kc[]; };
 layout(binding = 10) writeonly buffer BVC { uint vc[]; };
 layout(binding = 11) readonly buffer BPT { uint pt[]; };
+layout(binding = 12) readonly buffer BB { float bias[]; };    // [extent][nr]
+layout(binding = 13) readonly buffer BS { float sink[]; };    // [token][head]
 #ifdef KV8
 shared int sq[gl_WorkGroupSize.x];
 #endif
-layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint nr; uint flags; float qk_clip; float rel_clip; float eps; uint stride; uint page_shift; uint ring; } pc;
+layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint nr; uint flags; float qk_clip; float rel_clip; float eps; uint stride; uint page_shift; uint ring; uint extent; } pc;
 shared float sv[gl_WorkGroupSize.x];
 shared float red[gl_WorkGroupSize.x];
+shared float srel[gl_WorkGroupSize.x];
 
 // Sum of squares over the workgroup of each lane's v.
 float sumsq(float v) {
@@ -69,7 +75,14 @@ void main() {
     float qv = clipped(has_q ? qraw[(tk * pc.nh + g) * pc.hd + d] * qclip[g * pc.hd + d] : 0.0, pc.qk_clip);
     if (has_q) q[(tk * pc.nh + g) * pc.hd + d] = qv * tau;
     float rv = clipped(has_q && d < pc.nr ? rraw[(tk * pc.nh + g) * pc.nr + d] * rclip[g * pc.nr + d] : 0.0, pc.rel_clip);
-    if (has_q && d < pc.nr) r[(tk * pc.nh + g) * pc.nr + d] = rv * tau;
+    srel[d] = rv * tau;
+    barrier();
+    if (has_q)
+        for (uint e = d; e <= pc.extent; e += pc.hd) {
+            float v = 0.0;
+            if (e < pc.extent) for (uint k = 0u; k < pc.nr; k++) v += bias[e * pc.nr + k] * srel[k];
+            table[(tk * pc.nh + g) * (pc.extent + 1u) + e] = v - sink[tk * pc.nh + g];
+        }
     uint kin = (tk * pc.nkv + g) * pc.hd + d;
     float kv = clipped(has_kv ? kraw[kin] : 0.0, pc.qk_clip);
     float vv = has_kv ? vraw[kin] : 0.0;

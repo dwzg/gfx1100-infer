@@ -223,8 +223,11 @@ weight exactly once per token, as cheaply as possible:
 - *Position bias and sinks in the score kernel.* A table of bias by distance is computed per query
   head once per token; the score kernel adds its entry for each position's distance, and the
   softmax kernel adds the sink's term.
-- *The loop is unrolled when the forward pass is recorded*: 48 slot executions, about 2,000
-  dispatches per token. Nothing here is fused yet; that is tuning for the real card.
+- *The loop is unrolled when the forward pass is recorded*: 48 slot executions. Consecutive
+  steps are fused into single kernels where one would otherwise wait for the other (mixing with
+  the norm that follows it, the message controllers, routing with its matrix product, the bias
+  table with the cache write, the experts' sum with the convolution and the residual), which
+  leaves 1,292 dispatches and 896 synchronisation points per token (down from 1,963 and 1,449).
 
 **Correctness first.** `src/core/ref.cpp` is a plain scalar implementation of the forward pass.
 The GPU engine is checked against it logit by logit, and it is itself checked by generating
@@ -252,7 +255,7 @@ What was checked, and how:
 | Reply parser: 14 replies, each fed in pieces of 1, 2, 3, 7, 64 bytes and whole | Expected blocks; events add up to the blocks; parsed and written back gives the original text | All pass |
 | Server protocol: streaming, forced tool call, tool result, reuse across turns and across a side request, cancel, stop sequence, errors | Official `anthropic` Python SDK 2.14 as the client | All pass; a follow-up turn reused 432 of 432 earlier tokens |
 | Inkling 2 Mini, CPU reference | The text it writes | Coherent reasoning and a correct answer ("Capital of France is Paris ... `s[::-1]`") |
-| Inkling 2 Mini, GPU engine: token by token, prompts in batches of 8, 8-bit cache, and a start at position 9,000 (ring wrap-around, distances past the bias table, position scaling) | Its CPU reference | Relative logit error 7e-5 (half precision), 4e-4 at position 9,000, 1.8e-2 (8-bit); same top token throughout |
+| Inkling 2 Mini, GPU engine: token by token, prompts in batches of 8, 8-bit cache, and a start at position 9,000 (ring wrap-around, distances past the bias table, position scaling) | Its CPU reference | Relative logit error 7e-5 (half precision), 4e-4 at position 9,000, about 2e-2 (8-bit); same top token throughout |
 | Conversation cache with the Inkling engine: continuing, a side request branching off, returning, a second conversation with the same beginning | Processing the same tokens from scratch | Bit-identical logits |
 | Inkling prompt formatting (32 prompts) and reply parsing (6 cases at every piece size) | Its own template run with jinja2; expected blocks | Byte-identical; all pass |
 | Claude Code itself: CLI 2.1.332 with its default system prompt and 13 tools (12,453 prompt tokens), asked to read a file and report a value from it; Qwen 3.5 0.8B on the CPU driver | The right answer | Called its Read tool, then answered correctly; the second request reused 12,558 of 12,587 prompt tokens |
@@ -304,8 +307,8 @@ In order:
    and how well the model handles Claude Code's tool calls.
 5. Inkling 2 Mini: `gfxi compare Inkling-2-Mini-UD-Q4_K_M.gguf` (GPU against the CPU reference,
    this time with every expert on the device), then `gfxi bench` and `gfxi serve` with it. Its
-   forward pass is about 2,000 small dispatches per token, so expect dispatch overhead rather than
-   memory bandwidth to set its speed until kernels are fused.
+   forward pass is about 1,300 small dispatches with 900 synchronisation points per token, so
+   expect those, rather than memory bandwidth, to set its speed; `gfxi bench` shows what one costs.
 
 ## Layout
 

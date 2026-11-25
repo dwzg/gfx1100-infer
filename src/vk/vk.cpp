@@ -8,7 +8,7 @@
 namespace gfx {
 
 namespace {
-constexpr uint32_t k_max_bindings = 12;
+constexpr uint32_t k_max_bindings = 16;
 constexpr uint32_t k_push_bytes = 128;
 constexpr uint64_t k_staging_bytes = 64ull << 20;
 
@@ -148,6 +148,12 @@ Device::Device(const std::string &select_in) {
     vkGetDeviceQueue(dev_, queue_family_, 0, &queue_);
     push_descriptor_ = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(dev_, "vkCmdPushDescriptorSetKHR");
     if (!push_descriptor_) throw std::runtime_error("vkCmdPushDescriptorSetKHR is not available");
+    {
+        VkPhysicalDevicePushDescriptorPropertiesKHR pd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; p2.pNext = &pd;
+        vkGetPhysicalDeviceProperties2(phys_, &p2);
+        if (pd.maxPushDescriptors < k_max_bindings) throw std::runtime_error("this device allows too few push descriptors (" + std::to_string(pd.maxPushDescriptors) + ")");
+    }
 
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; cpi.queueFamilyIndex = queue_family_;

@@ -457,8 +457,8 @@ static int cmd_compare(int argc, char **argv) {
         printf("reference done; %zu of %d expert slots are needed on the device\n", n_used, idesc.n_layer * idesc.n_expert);
         GpuModel gpu(dev, g, idesc, n_ctx, kv8, 256ull << 20, batch, true, [&](int layer, int e) { return used[layer][e]; });
         if (skip > 0) gpu.skip_to(skip);
-        printf("device %s, model %s, weights on device %.2f GiB (allocated), %s cache, %zu prompt tokens + %d generated from position %d, %zu dispatches per token\n", dev.caps().name.c_str(),
-               idesc.name.c_str(), gpu.weight_bytes() / 1073741824.0, kv8 ? "8-bit" : "half-precision", ids.size(), n_extra, skip, gpu.dispatches_per_token());
+        printf("device %s, model %s, weights on device %.2f GiB (allocated), %s cache, %zu prompt tokens + %d generated from position %d, %zu dispatches and %zu sync points per token\n", dev.caps().name.c_str(),
+               idesc.name.c_str(), gpu.weight_bytes() / 1073741824.0, kv8 ? "8-bit" : "half-precision", ids.size(), n_extra, skip, gpu.dispatches_per_token(), gpu.barriers_per_token());
         double worst = 0; int mismatches = 0;
         for (size_t step = 0; step < want.size(); step++) {
             const std::vector<float> &lg = step == 0 ? gpu.eval(ids.data(), (int)ids.size()) : gpu.eval(&extra[step - 1], 1);
