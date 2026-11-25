@@ -1,6 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// Prepare one token for full attention. One workgroup per head, one lane per head dimension:
+// Prepare tokens for full attention. One workgroup per (head, token), one lane per head dimension;
+// token k of the batch sits at position ctl.pos + k:
 //   query:  split off the output gate, RMS-normalise, rotate by position -> q, gate
 //   key:    RMS-normalise, rotate by position -> key cache row `pos`
 //   value:  -> value cache row `pos`
@@ -40,7 +41,8 @@ float norm_rotate(float v, uint w_off) {
         uint hf = pc.rope_dim / 2u, pair, other; bool first;
         if ((pc.flags & 4u) != 0u) { first = d < hf; pair = first ? d : d - hf; other = first ? d + hf : d - hf; }
         else { first = (d & 1u) == 0u; pair = d >> 1u; other = d ^ 1u; }
-        float c = ctl.rot[2u * pair], s = ctl.rot[2u * pair + 1u];
+        uint rb = gl_WorkGroupID.y * pc.rope_dim + 2u * pair;
+        float c = ctl.rot[rb], s = ctl.rot[rb + 1u];
         float x0 = first ? v : sv[other], x1 = first ? sv[other] : v;
         v = first ? x0 * c - x1 * s : x0 * s + x1 * c;
     }
@@ -67,22 +69,23 @@ uint packed4(uint d) { return uint(sq[d] & 255) | (uint(sq[d + 1u] & 255) << 8) 
 #endif
 
 void main() {
-    uint g = gl_WorkGroupID.x, d = gl_LocalInvocationID.x;
+    uint g = gl_WorkGroupID.x, d = gl_LocalInvocationID.x, tk = gl_WorkGroupID.y, pos = ctl.pos + tk;
+    uint qin = tk * pc.nh * pc.qw + g * pc.qw + d, qout = tk * pc.nh * pc.hd + g * pc.hd + d, kin = tk * pc.nkv * pc.hd + g * pc.hd + d;
     bool has_q = g < pc.nh, has_kv = g < pc.nkv;
-    float qv = has_q ? qfull[g * pc.qw + d] : 0.0;
+    float qv = has_q ? qfull[qin] : 0.0;
     qv = norm_rotate(qv, 0u);
     if (has_q) {
-        q[g * pc.hd + d] = qv;
-        if ((pc.flags & 2u) != 0u) gate[g * pc.hd + d] = qfull[g * pc.qw + pc.hd + d];
+        q[qout] = qv;
+        if ((pc.flags & 2u) != 0u) gate[qout] = qfull[qin + pc.hd];
     }
-    float kv = has_kv ? kraw[g * pc.hd + d] : 0.0;
+    float kv = has_kv ? kraw[kin] : 0.0;
     kv = norm_rotate(kv, pc.hd);
-    float vv = has_kv ? vraw[g * pc.hd + d] : 0.0;
+    float vv = has_kv ? vraw[kin] : 0.0;
 #ifdef KV8
-    uint pk = pc.hd / 4u + pc.hd / 64u, vrow = ctl.pos * pc.nkv * pk + g * pk;
+    uint pk = pc.hd / 4u + pc.hd / 64u, vrow = pos * pc.nkv * pk + g * pk;
     quantise8(kv);
-    if (has_kv && (d & 3u) == 0u) kc[(g * pk + (d >> 2)) * pc.stride + ctl.pos] = packed4(d);
-    if (has_kv && (d & 63u) == 0u) kc[(g * pk + pc.hd / 4u + (d >> 6)) * pc.stride + ctl.pos] = packHalf2x16(vec2(block_scale(d >> 5), block_scale((d >> 5) + 1u)));
+    if (has_kv && (d & 3u) == 0u) kc[(g * pk + (d >> 2)) * pc.stride + pos] = packed4(d);
+    if (has_kv && (d & 63u) == 0u) kc[(g * pk + pc.hd / 4u + (d >> 6)) * pc.stride + pos] = packHalf2x16(vec2(block_scale(d >> 5), block_scale((d >> 5) + 1u)));
     barrier();
     quantise8(vv);
     if (has_kv && (d & 3u) == 0u) vc[vrow + (d >> 2)] = packed4(d);
@@ -92,8 +95,8 @@ void main() {
     sv[d] = kv; red[d] = vv;
     barrier();
     if (has_kv && (d & 1u) == 0u) {
-        kc[(g * pk + (d >> 1)) * pc.stride + ctl.pos] = packHalf2x16(vec2(sv[d], sv[d + 1u]));
-        vc[ctl.pos * pc.nkv * pk + g * pk + (d >> 1)] = packHalf2x16(vec2(red[d], red[d + 1u]));
+        kc[(g * pk + (d >> 1)) * pc.stride + pos] = packHalf2x16(vec2(sv[d], sv[d + 1u]));
+        vc[pos * pc.nkv * pk + g * pk + (d >> 1)] = packHalf2x16(vec2(red[d], red[d + 1u]));
     }
 #endif
 }

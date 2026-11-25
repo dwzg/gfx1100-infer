@@ -7,6 +7,11 @@
 // All formats decode as   weight = scale_j * (code - offset_j)   per sub-block j, so a row is
 //   sum_j scale_j * ( sum_i code_i * x_i  -  offset_j * X_j ),   X_j = sum of x over sub-block j.
 // X_j comes precomputed (xs: sums over 16 columns), which keeps offsets out of the inner loop.
+//
+// BATCH builds the matrix-matrix form: T tokens per workgroup (gl_WorkGroupID.y selects the
+// tile). Each weight is loaded and decoded once and multiplied into T accumulators, so the
+// per-token cost is one multiply-add per weight. The format code below is written against a
+// small set of accumulator operations that are scalar or T-wide.
 #include "common.glsl"
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 64) in;
@@ -15,18 +20,39 @@ layout(binding = 1) readonly buffer BX { float x[]; };
 layout(binding = 2) readonly buffer BXS { float xs[]; };
 layout(binding = 3) writeonly buffer BY { float y[]; };
 layout(binding = 4) readonly buffer BB { float bias[]; };
+#ifdef BATCH
+#define T 4u
+layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; uint n_tokens; uint x_stride; uint xs_stride; uint y_stride; } pc;
+uint g_x0, g_s0;                   // offsets of the tile's first token in x and xs
+#define ACC float[T]
+#define FOR_T for (uint t = 0u; t < T; t++)
+#define A(a) a[t]
+#define X(i) x[g_x0 + t * pc.x_stride + (i)]
+#define XS(i) xs[g_s0 + t * pc.xs_stride + (i)]
+#else
 layout(push_constant) uniform PC { uint n_sb; uint stride; uint n_rows; uint row0; uint flags; } pc;
+#define ACC float
+#define FOR_T
+#define A(a) a
+#define X(i) x[i]
+#define XS(i) xs[i]
+#endif
 
 #define M4 0x0F0F0F0Fu
+#define BYTE(v, i) (((v) >> (8u * (i))) & 0xFFu)
 uint g_base;                       // index of word 0 of the current super-block for this lane
 #define LW(k) w[g_base + (k) * pc.stride]
+ACC g_tot;                         // the row's running result
 
-// Four byte-packed codes times four consecutive inputs.
-float dot4(uint v, uint xb) {
-    return float(v & 0xFFu) * x[xb] + float((v >> 8) & 0xFFu) * x[xb + 1u] + float((v >> 16) & 0xFFu) * x[xb + 2u] + float(v >> 24) * x[xb + 3u];
-}
-// Sum of x over 32 columns starting at 16-column block b.
-float xsum32(uint b) { return xs[b] + xs[b + 1u]; }
+ACC acc_zero() { ACC a; FOR_T A(a) = 0.0; return a; }
+// a += four weights (already floats) times four consecutive inputs
+void acc_mul4(inout ACC a, vec4 f, uint xb) { FOR_T A(a) += f.x * X(xb) + f.y * X(xb + 1u) + f.z * X(xb + 2u) + f.w * X(xb + 3u); }
+// four byte-packed unsigned codes
+void acc_dot4(inout ACC a, uint v, uint xb) { acc_mul4(a, vec4(float(v & 0xFFu), float((v >> 8) & 0xFFu), float((v >> 16) & 0xFFu), float(v >> 24)), xb); }
+void acc_axpy(inout ACC y_, float s, ACC a) { FOR_T A(y_) += s * A(a); }
+// a += k * (sum of x over the 16-column block b)      /  over the 32 columns starting at block b
+void acc_xs(inout ACC a, float k, uint b) { FOR_T A(a) += k * XS(b); }
+void acc_xs32(inout ACC a, float k, uint b) { FOR_T A(a) += k * (XS(b) + XS(b + 1u)); }
 
 #if defined(FMT_IQ4_XS) || defined(FMT_IQ4_NL) || defined(FMT_NVFP4)
 // 16-entry codebooks, stored biased so every entry is an unsigned byte.
@@ -41,9 +67,7 @@ float lut(uint c) {
     uint64_t t = (c & 8u) != 0u ? hi : lo;
     return float(uint(t >> ((c & 7u) * 8u)) & 0xFFu);
 }
-float dot4c(uint v, uint xb) {
-    return lut(v & 0xFFu) * x[xb] + lut((v >> 8) & 0xFFu) * x[xb + 1u] + lut((v >> 16) & 0xFFu) * x[xb + 2u] + lut(v >> 24) * x[xb + 3u];
-}
+void acc_dot4c(inout ACC a, uint v, uint xb) { acc_mul4(a, vec4(lut(v & 0xFFu), lut((v >> 8) & 0xFFu), lut((v >> 16) & 0xFFu), lut(v >> 24)), xb); }
 #endif
 
 #if defined(FMT_Q4_K) || defined(FMT_Q5_K)
@@ -56,159 +80,144 @@ uvec2 scale_min(uint j, uint s0, uint s1, uint s2) {
 }
 #endif
 
+#if defined(FMT_Q4_K) || defined(FMT_Q5_K)
+#define SB 256u
 #if defined(FMT_Q4_K)
-#define SB 256u
 #define NW 36u
-// words: 0 = d | dmin<<16, 1..3 = scales, 4..35 = nibbles (low nibble: first 32 columns of a pair of sub-blocks)
-float superblock(uint xb) {
-    vec2 dm = unpackHalf2x16(LW(0u));
-    uint s0 = LW(1u), s1 = LW(2u), s2 = LW(3u), sx = xb >> 4;
-    float acc = 0.0, accm = 0.0;
-    for (uint g = 0u; g < 4u; g++) {
-        float a = 0.0, b = 0.0;
-        for (uint k = 0u; k < 8u; k++) {
-            uint v = LW(4u + 8u * g + k), c = xb + 64u * g + 4u * k;
-            a += dot4(v & M4, c);
-            b += dot4((v >> 4) & M4, c + 32u);
-        }
-        uvec2 ja = scale_min(2u * g, s0, s1, s2), jb = scale_min(2u * g + 1u, s0, s1, s2);
-        acc += float(ja.x) * a + float(jb.x) * b;
-        accm += float(ja.y) * xsum32(sx + 4u * g) + float(jb.y) * xsum32(sx + 4u * g + 2u);
-    }
-    return dm.x * acc - dm.y * accm;
-}
-#elif defined(FMT_Q5_K)
-#define SB 256u
+#define QS0 4u
+#else
 #define NW 44u
-// words: 0 = d | dmin<<16, 1..3 = scales, 4..11 = high bits, 12..43 = nibbles
-float superblock(uint xb) {
+#define QS0 12u
+#endif
+// words: 0 = d | dmin<<16, 1..3 = scales, [Q5_K: 4..11 = high bits,] then 32 words of nibbles
+// (low nibble: first 32 columns of a pair of sub-blocks).   weight = d * scale * code - dmin * min
+void superblock(uint xb) {
     vec2 dm = unpackHalf2x16(LW(0u));
     uint s0 = LW(1u), s1 = LW(2u), s2 = LW(3u), sx = xb >> 4;
-    float acc = 0.0, accm = 0.0;
     for (uint g = 0u; g < 4u; g++) {
-        float a = 0.0, b = 0.0;
+        ACC a = acc_zero(), b = acc_zero();
         for (uint k = 0u; k < 8u; k++) {
-            uint v = LW(12u + 8u * g + k), h = LW(4u + k), c = xb + 64u * g + 4u * k;
-            a += dot4((v & M4) | (((h >> (2u * g)) & 0x01010101u) << 4), c);
-            b += dot4(((v >> 4) & M4) | (((h >> (2u * g + 1u)) & 0x01010101u) << 4), c + 32u);
+            uint v = LW(QS0 + 8u * g + k), c = xb + 64u * g + 4u * k;
+#if defined(FMT_Q4_K)
+            acc_dot4(a, v & M4, c);
+            acc_dot4(b, (v >> 4) & M4, c + 32u);
+#else
+            uint h = LW(4u + k);
+            acc_dot4(a, (v & M4) | (((h >> (2u * g)) & 0x01010101u) << 4), c);
+            acc_dot4(b, ((v >> 4) & M4) | (((h >> (2u * g + 1u)) & 0x01010101u) << 4), c + 32u);
+#endif
         }
         uvec2 ja = scale_min(2u * g, s0, s1, s2), jb = scale_min(2u * g + 1u, s0, s1, s2);
-        acc += float(ja.x) * a + float(jb.x) * b;
-        accm += float(ja.y) * xsum32(sx + 4u * g) + float(jb.y) * xsum32(sx + 4u * g + 2u);
+        acc_axpy(g_tot, dm.x * float(ja.x), a);
+        acc_axpy(g_tot, dm.x * float(jb.x), b);
+        acc_xs32(g_tot, -dm.y * float(ja.y), sx + 4u * g);
+        acc_xs32(g_tot, -dm.y * float(jb.y), sx + 4u * g + 2u);
     }
-    return dm.x * acc - dm.y * accm;
 }
 #elif defined(FMT_Q6_K)
 #define SB 256u
 #define NW 53u
 // words: 0..31 = low nibbles, 32..47 = high 2 bits, 48..51 = int8 scales, 52 = d.   weight = d * scale * (code - 32)
 float scale8(uint idx) { return float(bitfieldExtract(int(LW(48u + (idx >> 2))), int(8u * (idx & 3u)), 8)); }
-float superblock(uint xb) {
+void superblock(uint xb) {
     float d = unpackHalf2x16(LW(52u)).x;
     uint sx = xb >> 4;
-    float acc = 0.0;
-    for (uint n = 0u; n < 2u; n++) {
-        for (uint is = 0u; is < 2u; is++) {
-            float a1 = 0.0, a2 = 0.0, a3 = 0.0, a4 = 0.0;
-            for (uint k4 = 0u; k4 < 4u; k4++) {
-                uint kk = 4u * is + k4;
-                uint a = LW(16u * n + kk), b = LW(16u * n + 8u + kk), h = LW(32u + 8u * n + kk), c = xb + 128u * n + 4u * kk;
-                a1 += dot4((a & M4) | ((h & 0x03030303u) << 4), c);
-                a2 += dot4((b & M4) | (((h >> 2) & 0x03030303u) << 4), c + 32u);
-                a3 += dot4(((a >> 4) & M4) | (((h >> 4) & 0x03030303u) << 4), c + 64u);
-                a4 += dot4(((b >> 4) & M4) | (((h >> 6) & 0x03030303u) << 4), c + 96u);
+    // Each half (n) holds four quarters of 32 columns; quarter q takes the low (q < 2) or high
+    // nibbles of the first (q even) or second (q odd) 32 bytes, and bit pair q of the high bits.
+    for (uint n = 0u; n < 2u; n++)
+        for (uint is = 0u; is < 2u; is++)
+            for (uint q = 0u; q < 4u; q++) {
+                ACC a = acc_zero();
+                for (uint k4 = 0u; k4 < 4u; k4++) {
+                    uint kk = 4u * is + k4;
+                    uint lo = LW(16u * n + 8u * (q & 1u) + kk), h = LW(32u + 8u * n + kk);
+                    uint nib = q >= 2u ? (lo >> 4) & M4 : lo & M4;
+                    acc_dot4(a, nib | (((h >> (2u * q)) & 0x03030303u) << 4), xb + 128u * n + 32u * q + 4u * kk);
+                }
+                uint si = 8u * n + is + 2u * q;       // scale / 16-column block index
+                float f = d * scale8(si);
+                acc_axpy(g_tot, f, a); acc_xs(g_tot, -32.0 * f, sx + si);
             }
-            uint si = 8u * n + is;        // scale / 16-column block index of the first quarter
-            acc += scale8(si) * (a1 - 32.0 * xs[sx + si]) + scale8(si + 2u) * (a2 - 32.0 * xs[sx + si + 2u])
-                 + scale8(si + 4u) * (a3 - 32.0 * xs[sx + si + 4u]) + scale8(si + 6u) * (a4 - 32.0 * xs[sx + si + 6u]);
-        }
-    }
-    return d * acc;
 }
 #elif defined(FMT_Q3_K)
 #define SB 256u
 #define NW 28u
 // words: 0..7 = high bit masks, 8..23 = 2-bit codes, 24..26 = packed 6-bit scales, 27 = d.
 // weight = d * (scale - 32) * (code - 4), code = low 2 bits + 4 * high bit
-float superblock(uint xb) {
+void superblock(uint xb) {
     float d = unpackHalf2x16(LW(27u)).x;
-    uint a0 = LW(24u), a1 = LW(25u), t = LW(26u), sx = xb >> 4;
+    uint a0 = LW(24u), a1 = LW(25u), tt = LW(26u), sx = xb >> 4;
     uint sw[4];
-    sw[0] = (a0 & M4) | ((t & 0x03030303u) << 4);          sw[1] = (a1 & M4) | (((t >> 2) & 0x03030303u) << 4);
-    sw[2] = ((a0 >> 4) & M4) | (((t >> 4) & 0x03030303u) << 4); sw[3] = ((a1 >> 4) & M4) | (((t >> 6) & 0x03030303u) << 4);
-    float acc = 0.0;
+    sw[0] = (a0 & M4) | ((tt & 0x03030303u) << 4);          sw[1] = (a1 & M4) | (((tt >> 2) & 0x03030303u) << 4);
+    sw[2] = ((a0 >> 4) & M4) | (((tt >> 4) & 0x03030303u) << 4); sw[3] = ((a1 >> 4) & M4) | (((tt >> 6) & 0x03030303u) << 4);
     for (uint n = 0u; n < 2u; n++)
         for (uint j = 0u; j < 4u; j++)
             for (uint hh = 0u; hh < 2u; hh++) {
-                float a = 0.0;
+                ACC a = acc_zero();
                 for (uint k = 0u; k < 4u; k++) {
                     uint q = LW(8u + 8u * n + 4u * hh + k), hm = LW(4u * hh + k);
-                    a += dot4(((q >> (2u * j)) & 0x03030303u) | (((hm >> (4u * n + j)) & 0x01010101u) << 2), xb + 128u * n + 32u * j + 16u * hh + 4u * k);
+                    acc_dot4(a, ((q >> (2u * j)) & 0x03030303u) | (((hm >> (4u * n + j)) & 0x01010101u) << 2), xb + 128u * n + 32u * j + 16u * hh + 4u * k);
                 }
                 uint is = 8u * n + 2u * j + hh;
-                float sc = float(int((sw[is >> 2] >> (8u * (is & 3u))) & 0xFFu) - 32);
-                acc += sc * (a - 4.0 * xs[sx + is]);
+                float f = d * float(int(BYTE(sw[is >> 2], is & 3u)) - 32);
+                acc_axpy(g_tot, f, a); acc_xs(g_tot, -4.0 * f, sx + is);
             }
-    return d * acc;
 }
 #elif defined(FMT_IQ4_XS)
 #define SB 256u
 #define NW 34u
 // words: 0 = d | scales_h<<16, 1 = scales_l, 2..33 = nibbles.   weight = d * (ls - 32) * level[code]
-float superblock(uint xb) {
+void superblock(uint xb) {
     uint w0 = LW(0u), sl = LW(1u), sx = xb >> 4;
-    float d = unpackHalf2x16(w0).x, acc = 0.0;
+    float d = unpackHalf2x16(w0).x;
     for (uint ib = 0u; ib < 8u; ib++) {
-        float a = 0.0;
+        ACC a = acc_zero();
         for (uint k = 0u; k < 4u; k++) {
             uint v = LW(2u + 4u * ib + k), c = xb + 32u * ib + 4u * k;
-            a += dot4c(v & M4, c) + dot4c((v >> 4) & M4, c + 16u);
+            acc_dot4c(a, v & M4, c); acc_dot4c(a, (v >> 4) & M4, c + 16u);
         }
         uint ls = ((sl >> (4u * ib)) & 15u) | (((w0 >> (16u + 2u * ib)) & 3u) << 4);
-        acc += float(int(ls) - 32) * (a - 127.0 * xsum32(sx + 2u * ib));
+        float f = d * float(int(ls) - 32);
+        acc_axpy(g_tot, f, a); acc_xs32(g_tot, -127.0 * f, sx + 2u * ib);
     }
-    return d * acc;
 }
 #elif defined(FMT_IQ4_NL) || defined(FMT_Q4_0)
 #define SB 64u
 #define NW 9u
 // words: 0 = d0 | d1<<16, 1..4 = nibbles of block 0, 5..8 = nibbles of block 1
-float superblock(uint xb) {
+void superblock(uint xb) {
     vec2 dd = unpackHalf2x16(LW(0u));
     uint sx = xb >> 4;
-    float acc = 0.0;
     for (uint blk = 0u; blk < 2u; blk++) {
-        float a = 0.0;
+        ACC a = acc_zero();
         for (uint k = 0u; k < 4u; k++) {
             uint v = LW(1u + 4u * blk + k), c = xb + 32u * blk + 4u * k;
 #if defined(FMT_IQ4_NL)
-            a += dot4c(v & M4, c) + dot4c((v >> 4) & M4, c + 16u);
+            acc_dot4c(a, v & M4, c); acc_dot4c(a, (v >> 4) & M4, c + 16u);
 #else
-            a += dot4(v & M4, c) + dot4((v >> 4) & M4, c + 16u);
+            acc_dot4(a, v & M4, c); acc_dot4(a, (v >> 4) & M4, c + 16u);
 #endif
         }
+        acc_axpy(g_tot, dd[blk], a);
 #if defined(FMT_IQ4_NL)
-        acc += dd[blk] * (a - 127.0 * xsum32(sx + 2u * blk));
+        acc_xs32(g_tot, -127.0 * dd[blk], sx + 2u * blk);
 #else
-        acc += dd[blk] * (a - 8.0 * xsum32(sx + 2u * blk));
+        acc_xs32(g_tot, -8.0 * dd[blk], sx + 2u * blk);
 #endif
     }
-    return acc;
 }
 #elif defined(FMT_Q8_0)
 #define SB 64u
 #define NW 17u
 // words: 0 = d0 | d1<<16, 1..8 = bytes of block 0 (biased by 128), 9..16 = bytes of block 1
-float superblock(uint xb) {
+void superblock(uint xb) {
     vec2 dd = unpackHalf2x16(LW(0u));
     uint sx = xb >> 4;
-    float acc = 0.0;
     for (uint blk = 0u; blk < 2u; blk++) {
-        float a = 0.0;
-        for (uint k = 0u; k < 8u; k++) a += dot4(LW(1u + 8u * blk + k), xb + 32u * blk + 4u * k);
-        acc += dd[blk] * (a - 128.0 * xsum32(sx + 2u * blk));
+        ACC a = acc_zero();
+        for (uint k = 0u; k < 8u; k++) acc_dot4(a, LW(1u + 8u * blk + k), xb + 32u * blk + 4u * k);
+        acc_axpy(g_tot, dd[blk], a); acc_xs32(g_tot, -128.0 * dd[blk], sx + 2u * blk);
     }
-    return acc;
 }
 #elif defined(FMT_NVFP4)
 #define SB 64u
@@ -219,119 +228,111 @@ float ue4m3_half(uint b) {
     float v = e == 0u ? float(m) * (1.0 / 1024.0) : uintBitsToFloat(((e + 119u) << 23) | (m << 20));
     return (b == 0u || b == 0x7Fu) ? 0.0 : v;
 }
-float superblock(uint xb) {
+void superblock(uint xb) {
     uint w0 = LW(0u), sx = xb >> 4;
-    float acc = 0.0;
     for (uint s = 0u; s < 4u; s++) {
-        float a = 0.0;
+        ACC a = acc_zero();
         for (uint k = 0u; k < 2u; k++) {
             uint v = LW(1u + 2u * s + k), c = xb + 16u * s + 4u * k;
-            a += dot4c(v & M4, c) + dot4c((v >> 4) & M4, c + 8u);
+            acc_dot4c(a, v & M4, c); acc_dot4c(a, (v >> 4) & M4, c + 8u);
         }
-        acc += ue4m3_half((w0 >> (8u * s)) & 0xFFu) * (a - 12.0 * xs[sx + s]);
+        float f = ue4m3_half(BYTE(w0, s));
+        acc_axpy(g_tot, f, a); acc_xs(g_tot, -12.0 * f, sx + s);
     }
-    return acc;
 }
 #elif defined(FMT_IQ3_S) || defined(FMT_IQ3_XXS) || defined(FMT_IQ2_S) || defined(FMT_IQ2_XS) || defined(FMT_IQ2_XXS)
 // Codebook formats: an index selects a group of unsigned magnitudes from a table, with a separate
 // sign bit per weight.   weight = d * block_scale * (+-magnitude)
 #define SB 256u
 layout(binding = 5) readonly buffer BG { uint grid[]; };
+float sgn(uint mag, uint bit) { return uintBitsToFloat(floatBitsToUint(float(mag)) ^ (bit << 31)); }
 // Four magnitudes (bytes of m) with sign bits sg[0..3], times four consecutive inputs.
-float dot4s(uint m, uint sg, uint xb) {
-    return uintBitsToFloat(floatBitsToUint(float(m & 0xFFu)) ^ ((sg & 1u) << 31)) * x[xb]
-         + uintBitsToFloat(floatBitsToUint(float((m >> 8) & 0xFFu)) ^ ((sg & 2u) << 30)) * x[xb + 1u]
-         + uintBitsToFloat(floatBitsToUint(float((m >> 16) & 0xFFu)) ^ ((sg & 4u) << 29)) * x[xb + 2u]
-         + uintBitsToFloat(floatBitsToUint(float(m >> 24)) ^ ((sg & 8u) << 28)) * x[xb + 3u];
+void acc_dot4s(inout ACC a, uint m, uint sg, uint xb) {
+    acc_mul4(a, vec4(sgn(m & 0xFFu, sg & 1u), sgn((m >> 8) & 0xFFu, (sg >> 1) & 1u), sgn((m >> 16) & 0xFFu, (sg >> 2) & 1u), sgn(m >> 24, (sg >> 3) & 1u)), xb);
 }
 // Eight magnitudes from a table of 64-bit entries, stored as two words each.
-float dot8s(uint idx, uint sg, uint xb) { return dot4s(grid[2u * idx], sg, xb) + dot4s(grid[2u * idx + 1u], sg >> 4, xb + 4u); }
+void acc_dot8s(inout ACC a, uint idx, uint sg, uint xb) { acc_dot4s(a, grid[2u * idx], sg, xb); acc_dot4s(a, grid[2u * idx + 1u], sg >> 4, xb + 4u); }
 // Sign byte for eight weights from its 7 stored bits: the eighth bit makes the parity even.
 uint signs8(uint s7) { return s7 | ((uint(bitCount(s7)) & 1u) << 7); }
-#define BYTE(v, i) (((v) >> (8u * (i))) & 0xFFu)
 
 #if defined(FMT_IQ3_S)
 #define NW 28u
 // words: 0 = d, 1 = eight 4-bit scales, 2..3 = high index bits, 4..19 = index bytes, 20..27 = sign bytes; table: 512 x 4
-float superblock(uint xb) {
+void superblock(uint xb) {
     float d = unpackHalf2x16(LW(0u)).x;
     uint scales = LW(1u);
-    float acc = 0.0;
     for (uint ib = 0u; ib < 8u; ib++) {
         uint q0 = LW(4u + 2u * ib), q1 = LW(5u + 2u * ib), sgw = LW(20u + ib);
         uint qh = BYTE(LW(2u + (ib >> 2)), ib & 3u);
-        float a = 0.0;
+        ACC a = acc_zero();
         for (uint l = 0u; l < 4u; l++) {
             uint qw = l < 2u ? q0 : q1, sh = 2u * (l & 1u);
             uint i1 = BYTE(qw, sh) | ((qh << (8u - 2u * l)) & 256u), i2 = BYTE(qw, sh + 1u) | ((qh << (7u - 2u * l)) & 256u);
             uint sg = BYTE(sgw, l), c = xb + 32u * ib + 8u * l;
-            a += dot4s(grid[i1], sg, c) + dot4s(grid[i2], sg >> 4, c + 4u);
+            acc_dot4s(a, grid[i1], sg, c); acc_dot4s(a, grid[i2], sg >> 4, c + 4u);
         }
-        acc += float(1u + 2u * ((scales >> (4u * ib)) & 15u)) * a;
+        acc_axpy(g_tot, d * float(1u + 2u * ((scales >> (4u * ib)) & 15u)), a);
     }
-    return d * acc;
 }
 #elif defined(FMT_IQ3_XXS)
 #define NW 25u
 // words: 0 = d, 1..16 = index bytes, 17..24 = four 7-bit sign groups + 4-bit scale; table: 256 x 4
-float superblock(uint xb) {
-    float d = unpackHalf2x16(LW(0u)).x, acc = 0.0;
+void superblock(uint xb) {
+    float d = unpackHalf2x16(LW(0u)).x;
     for (uint ib = 0u; ib < 8u; ib++) {
         uint q0 = LW(1u + 2u * ib), q1 = LW(2u + 2u * ib), sas = LW(17u + ib);
-        float a = 0.0;
+        ACC a = acc_zero();
         for (uint l = 0u; l < 4u; l++) {
             uint qw = l < 2u ? q0 : q1, sh = 2u * (l & 1u), sg = signs8((sas >> (7u * l)) & 127u), c = xb + 32u * ib + 8u * l;
-            a += dot4s(grid[BYTE(qw, sh)], sg, c) + dot4s(grid[BYTE(qw, sh + 1u)], sg >> 4, c + 4u);
+            acc_dot4s(a, grid[BYTE(qw, sh)], sg, c); acc_dot4s(a, grid[BYTE(qw, sh + 1u)], sg >> 4, c + 4u);
         }
-        acc += (0.5 + float(sas >> 28)) * a;
+        acc_axpy(g_tot, d * 0.5 * (0.5 + float(sas >> 28)), a);
     }
-    return d * 0.5 * acc;
 }
 #elif defined(FMT_IQ2_S)
 #define NW 21u
 // words: 0 = d, 1..8 = index bytes, 9..16 = sign bytes, 17..18 = high index bits, 19..20 = two 4-bit scales per 32 weights; table: 1024 x 8
-float superblock(uint xb) {
-    float d = unpackHalf2x16(LW(0u)).x, acc = 0.0;
+void superblock(uint xb) {
+    float d = unpackHalf2x16(LW(0u)).x;
     for (uint ib = 0u; ib < 8u; ib++) {
         uint qw = LW(1u + ib), sgw = LW(9u + ib), qh = BYTE(LW(17u + (ib >> 2)), ib & 3u), sc = BYTE(LW(19u + (ib >> 2)), ib & 3u);
-        float a0 = 0.0, a1 = 0.0;
-        for (uint l = 0u; l < 4u; l++) {
-            float t = dot8s(BYTE(qw, l) | ((qh << (8u - 2u * l)) & 0x300u), BYTE(sgw, l), xb + 32u * ib + 8u * l);
-            if (l < 2u) a0 += t; else a1 += t;
+        for (uint hf = 0u; hf < 2u; hf++) {
+            ACC a = acc_zero();
+            for (uint l = 2u * hf; l < 2u * hf + 2u; l++)
+                acc_dot8s(a, BYTE(qw, l) | ((qh << (8u - 2u * l)) & 0x300u), BYTE(sgw, l), xb + 32u * ib + 8u * l);
+            acc_axpy(g_tot, d * 0.25 * (0.5 + float((sc >> (4u * hf)) & 15u)), a);
         }
-        acc += (0.5 + float(sc & 15u)) * a0 + (0.5 + float(sc >> 4)) * a1;
     }
-    return d * 0.25 * acc;
 }
 #elif defined(FMT_IQ2_XS)
 #define NW 19u
 // words: 0 = d, 1..16 = 16-bit codes (9-bit index, 7 sign bits), 17..18 = two 4-bit scales per 32 weights; table: 512 x 8
-float superblock(uint xb) {
-    float d = unpackHalf2x16(LW(0u)).x, acc = 0.0;
+void superblock(uint xb) {
+    float d = unpackHalf2x16(LW(0u)).x;
     for (uint ib = 0u; ib < 8u; ib++) {
-        uint q0 = LW(1u + 2u * ib), q1 = LW(2u + 2u * ib), sc = BYTE(LW(17u + (ib >> 2)), ib & 3u);
-        float a0 = 0.0, a1 = 0.0;
-        for (uint l = 0u; l < 4u; l++) {
-            uint v = ((l < 2u ? q0 : q1) >> (16u * (l & 1u))) & 0xFFFFu;
-            float t = dot8s(v & 511u, signs8(v >> 9), xb + 32u * ib + 8u * l);
-            if (l < 2u) a0 += t; else a1 += t;
+        uint sc = BYTE(LW(17u + (ib >> 2)), ib & 3u);
+        for (uint hf = 0u; hf < 2u; hf++) {
+            uint qw = LW(1u + 2u * ib + hf);
+            ACC a = acc_zero();
+            for (uint l = 0u; l < 2u; l++) {
+                uint v = (qw >> (16u * l)) & 0xFFFFu;
+                acc_dot8s(a, v & 511u, signs8(v >> 9), xb + 32u * ib + 16u * hf + 8u * l);
+            }
+            acc_axpy(g_tot, d * 0.25 * (0.5 + float((sc >> (4u * hf)) & 15u)), a);
         }
-        acc += (0.5 + float(sc & 15u)) * a0 + (0.5 + float(sc >> 4)) * a1;
     }
-    return d * 0.25 * acc;
 }
 #else
 #define NW 17u
 // IQ2_XXS words: 0 = d, then per 32 weights: four index bytes, and four 7-bit sign groups + 4-bit scale; table: 256 x 8
-float superblock(uint xb) {
-    float d = unpackHalf2x16(LW(0u)).x, acc = 0.0;
+void superblock(uint xb) {
+    float d = unpackHalf2x16(LW(0u)).x;
     for (uint ib = 0u; ib < 8u; ib++) {
         uint qw = LW(1u + 2u * ib), sas = LW(2u + 2u * ib);
-        float a = 0.0;
-        for (uint l = 0u; l < 4u; l++) a += dot8s(BYTE(qw, l), signs8((sas >> (7u * l)) & 127u), xb + 32u * ib + 8u * l);
-        acc += (0.5 + float(sas >> 28)) * a;
+        ACC a = acc_zero();
+        for (uint l = 0u; l < 4u; l++) acc_dot8s(a, BYTE(qw, l), signs8((sas >> (7u * l)) & 127u), xb + 32u * ib + 8u * l);
+        acc_axpy(g_tot, d * 0.25 * (0.5 + float(sas >> 28)), a);
     }
-    return d * 0.25 * acc;
 }
 #endif
 #else
@@ -341,13 +342,20 @@ float superblock(uint xb) {
 void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= pc.stride) return;
-    float acc = 0.0;
+    g_tot = acc_zero();
+#ifdef BATCH
+    uint t0 = gl_WorkGroupID.y * T;
+    g_x0 = t0 * pc.x_stride; g_s0 = t0 * pc.xs_stride;
+#endif
     for (uint s = 0u; s < pc.n_sb; s++) {
         g_base = s * NW * pc.stride + row;
-        acc += superblock(s * SB);
+        superblock(s * SB);
     }
-    if (row < pc.n_rows) {
-        if ((pc.flags & 1u) != 0u) acc += bias[pc.row0 + row];
-        y[pc.row0 + row] = acc;
-    }
+    if (row >= pc.n_rows) return;
+    float bv = (pc.flags & 1u) != 0u ? bias[pc.row0 + row] : 0.0;
+#ifdef BATCH
+    FOR_T if (t0 + t < pc.n_tokens) y[(t0 + t) * pc.y_stride + pc.row0 + row] = g_tot[t] + bv;
+#else
+    y[pc.row0 + row] = g_tot + bv;
+#endif
 }

@@ -1,0 +1,16 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Keep the last KW-1 projections of each channel for the next batch's convolution.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer BM { float mixed[]; };   // [token][channel]
+layout(binding = 1) buffer BH { float hist[]; };             // [channel][KW-1], oldest first
+layout(push_constant) uniform PC { uint c_total; uint hw; uint n_tokens; } pc;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.c_total) return;
+    // New entry i is the projection of token n_tokens - hw + i; a negative index is an old entry.
+    // Ascending i only reads old entries at or above the one being written.
+    for (uint i = 0u; i < pc.hw; i++)
+        hist[c * pc.hw + i] = pc.n_tokens + i >= pc.hw ? mixed[(pc.n_tokens + i - pc.hw) * pc.c_total + c] : hist[c * pc.hw + pc.n_tokens + i];
+}

@@ -100,7 +100,7 @@ static int cmd_plan(int argc, char **argv) {
     if (d.output != d.tok_embd) printf("embedding table  stays on the CPU (%.2f GiB in the file)\n", d.tok_embd->nbytes / GiB);
     printf("fixed state      %.2f GiB  (linear-attention layers, independent of context)\n", rec / GiB);
     printf("cache per token  %.1f KiB half precision, %.1f KiB 8-bit\n", kv16 / 1024.0, kv8 / 1024.0);
-    double freeb = (vram - reserve) * GiB - (double)weights - (double)rec - 0.15 * GiB;  // 0.15 GiB working buffers
+    double freeb = (vram - reserve) * GiB - (double)weights - (double)rec - 0.25 * GiB;  // 0.25 GiB working buffers
     printf("budget           %.1f GiB GPU memory, %.2f GiB kept free for the desktop and driver\n", vram, reserve);
     if (freeb <= 0) { printf("does not fit: weights alone exceed the budget by %.2f GiB\n", -freeb / GiB); return 1; }
     long max16 = (long)(freeb / kv16), max8 = (long)(freeb / kv8);
@@ -178,11 +178,11 @@ static int cmd_tokenize(int argc, char **argv) {
 static int cmd_run(int argc, char **argv) {
     if (argc < 1) {
         fprintf(stderr, "usage: gfxi run <model.gguf> -p <prompt | @file> [-n tokens] [--chat] [--temp T] [--top-k K] [--top-p P]\n"
-                        "                [--seed S] [--ctx N|max] [--reserve GiB] [--threads N] [--device gpu|cpu|<name>] [--kv8] [--logits out.f32]\n"
+                        "                [--seed S] [--ctx N|max] [--reserve GiB] [--threads N] [--device gpu|cpu|<name>] [--kv8] [--batch N] [--logits out.f32]\n"
                         "                [--save-state file] [--load-state file]   keep / reuse a processed prompt\n");
         return 2;
     }
-    std::string prompt, logits_path, save_path, load_path, device = "gpu"; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false, kv8 = false, ctx_max = false; double reserve_gib = 0.25;
+    std::string prompt, logits_path, save_path, load_path, device = "gpu"; int n_predict = 64, n_ctx = 0, threads = (int)std::thread::hardware_concurrency(); bool chat = false, kv8 = false, ctx_max = false; double reserve_gib = 0.25; int batch = 32;
     SamplerParams sp; sp.temperature = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -200,6 +200,7 @@ static int cmd_run(int argc, char **argv) {
         else if (a == "--logits") logits_path = next();
         else if (a == "--device") device = next();
         else if (a == "--kv8") kv8 = true;
+        else if (a == "--batch") batch = atoi(next());
         else if (a == "--save-state") save_path = next();
         else if (a == "--load-state") load_path = next();
         else throw std::runtime_error("unknown option " + a);
@@ -223,7 +224,7 @@ static int cmd_run(int argc, char **argv) {
     } else {
         dev = std::make_unique<Device>(device == "gpu" ? "" : device);
         fprintf(stderr, "[%s] loading %s ...\n", dev->caps().name.c_str(), desc.name.c_str());
-        gpu = std::make_unique<GpuModel>(*dev, g, desc, ctx_max ? 0 : n_ctx, false, kv8, (uint64_t)(reserve_gib * 1073741824.0));
+        gpu = std::make_unique<GpuModel>(*dev, g, desc, ctx_max ? 0 : n_ctx, false, kv8, (uint64_t)(reserve_gib * 1073741824.0), batch);
         if ((int)ids.size() >= gpu->n_ctx()) throw std::runtime_error("the prompt (" + std::to_string(ids.size()) + " tokens) does not fit the context (" + std::to_string(gpu->n_ctx()) + ")");
         fprintf(stderr, "[%s] weights %.2f GiB, context %d tokens (%s cache, %.2f GiB), %zu dispatches and %zu sync points per token, %d prompt tokens\n", dev->caps().name.c_str(),
                 gpu->weight_bytes() / 1073741824.0, gpu->n_ctx(), kv8 ? "8-bit" : "half-precision", gpu->state_bytes() / 1073741824.0, gpu->dispatches_per_token(), gpu->barriers_per_token(), (int)ids.size());
@@ -269,7 +270,7 @@ static int cmd_run(int argc, char **argv) {
 // Run the GPU engine and the CPU reference on the same tokens and report how closely they agree.
 static int cmd_compare(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "usage: gfxi compare <model.gguf> [-p prompt] [-n extra tokens] [--device name] [--tol T] [--kv8] [--skip N]\n"); return 2; }
-    std::string prompt = "The quick brown fox jumps over the lazy dog. In 1969, humans first", device; int n_extra = 8; double tol = 0.05; bool fp16 = false, kv8 = false; int skip = 0;
+    std::string prompt = "The quick brown fox jumps over the lazy dog. In 1969, humans first", device; int n_extra = 8; double tol = 0.05; bool fp16 = false, kv8 = false; int skip = 0, batch = 32;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
@@ -280,6 +281,7 @@ static int cmd_compare(int argc, char **argv) {
         else if (a == "--fp16") fp16 = true;
         else if (a == "--kv8") kv8 = true;
         else if (a == "--skip") skip = atoi(next());   // start at this position, over an all-zero cache
+        else if (a == "--batch") batch = atoi(next());
         else throw std::runtime_error("unknown option " + a);
     }
     GGUF g; g.open(argv[0]);
@@ -288,7 +290,7 @@ static int cmd_compare(int argc, char **argv) {
     std::vector<int32_t> ids = tok.encode(prompt, true, true);
     int n_ctx = skip + (int)ids.size() + n_extra + 1;
     Device dev(device);
-    GpuModel gpu(dev, g, desc, n_ctx, fp16, kv8);
+    GpuModel gpu(dev, g, desc, n_ctx, fp16, kv8, 256ull << 20, batch);
     printf("weights on device: %.3f GiB\n", gpu.weight_bytes() / 1073741824.0);
     RefModel ref(g, desc, n_ctx, (int)std::thread::hardware_concurrency());
     if (skip > 0) { gpu.skip_to(skip); ref.skip_to(skip); }

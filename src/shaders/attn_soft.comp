@@ -7,11 +7,11 @@ layout(local_size_x = 256) in;
 layout(binding = 0) readonly buffer BCTL { uint pos; } ctl;
 layout(binding = 1) buffer BSC { float sc[]; };
 layout(binding = 2) writeonly buffer BZ { float z[]; };
-layout(push_constant) uniform PC { uint n_ctx; } pc;
+layout(push_constant) uniform PC { uint n_ctx; uint nh; uint tq0; } pc;
 shared float red[256];
 
 void main() {
-    uint h = gl_WorkGroupID.x, lid = gl_LocalInvocationID.x, n_pos = ctl.pos + 1u, sb = h * pc.n_ctx;
+    uint h = gl_WorkGroupID.x, lq = gl_WorkGroupID.y, tq = pc.tq0 + lq, lid = gl_LocalInvocationID.x, n_pos = ctl.pos + tq + 1u, sb = (lq * pc.nh + h) * pc.n_ctx;
     float mx = -3.0e38;
     for (uint t = lid; t < n_pos; t += 256u) mx = max(mx, sc[sb + t]);
     red[lid] = mx;
@@ -24,5 +24,5 @@ void main() {
     for (uint t = lid; t < n_pos; t += 256u) { float e = exp(sc[sb + t] - mx); sc[sb + t] = e; sum += e; }
     red[lid] = sum;
     barrier();
-    if (lid == 0u) { float s = 0.0; for (uint i = 0u; i < 256u; i++) s += red[i]; z[h] = 1.0 / s; }
+    if (lid == 0u) { float s = 0.0; for (uint i = 0u; i < 256u; i++) s += red[i]; z[tq * pc.nh + h] = 1.0 / s; }
 }

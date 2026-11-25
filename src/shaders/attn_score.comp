@@ -1,6 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// Attention scores for one query token against every cached position.
+// Attention scores of each query token (gl_WorkGroupID.z) against every cached position up to its own.
 // The key cache is plane-major, [kv head][plane][position], so this has the same shape as the
 // quantised matvec: one lane per cached position, adjacent lanes read adjacent words, and the
 // query is the same for all lanes. The G query heads that share a key head are scored together,
@@ -12,14 +12,15 @@ layout(binding = 0) readonly buffer BQ { float q[]; };
 layout(binding = 1) readonly buffer BKC { uint kc[]; };
 layout(binding = 2) readonly buffer BCTL { uint pos; } ctl;
 layout(binding = 3) writeonly buffer BSC { float sc[]; };   // [query head][n_ctx]
-layout(push_constant) uniform PC { uint hd; uint stride; uint n_ctx; float scale; } pc;
+layout(push_constant) uniform PC { uint hd; uint stride; uint n_ctx; float scale; uint nh; uint tq0; } pc;
 
 void main() {
-    uint t = gl_GlobalInvocationID.x, kvh = gl_WorkGroupID.y;
-    if (t > ctl.pos) return;
+    // Queries are scored in sub-batches: tq0 is the first query token of this one.
+    uint t = gl_GlobalInvocationID.x, kvh = gl_WorkGroupID.y, lq = gl_WorkGroupID.z, tq = pc.tq0 + lq;
+    if (t > ctl.pos + tq) return;
     float s[G];
     for (uint g = 0u; g < G; g++) s[g] = 0.0;
-    uint qb = kvh * G * pc.hd;
+    uint qb = (tq * pc.nh + kvh * G) * pc.hd;
 #ifdef KV8
     // planes per head: hd/4 words of four signed bytes, then hd/64 words of two half-precision scales
     uint base = kvh * (pc.hd / 4u + pc.hd / 64u);
@@ -46,5 +47,5 @@ void main() {
         for (uint g = 0u; g < G; g++) { uint o = qb + g * pc.hd + 2u * w; s[g] += kk.x * q[o] + kk.y * q[o + 1u]; }
     }
 #endif
-    for (uint g = 0u; g < G; g++) sc[(kvh * G + g) * pc.n_ctx + t] = s[g] * pc.scale;
+    for (uint g = 0u; g < G; g++) sc[(lq * pc.nh + kvh * G + g) * pc.n_ctx + t] = s[g] * pc.scale;
 }

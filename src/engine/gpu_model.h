@@ -2,6 +2,7 @@
 // pre-recorded sequence of compute dispatches, one submission per token.
 #pragma once
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -18,7 +19,9 @@ class GpuModel {
     //      memory and memory traffic of the half-precision cache, at a small accuracy cost).
     // n_ctx <= 0: use as much context as fits in the GPU memory that is free after loading the
     //      weights (capped at the model's trained context), keeping `reserve_bytes` unallocated.
-    GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16 = false, bool kv8 = false, uint64_t reserve_bytes = 256ull << 20);
+    // batch: how many prompt tokens are processed together (1 disables batching).
+    GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16 = false, bool kv8 = false, uint64_t reserve_bytes = 256ull << 20, int batch = 32);
+    int batch() const { return batch_; }
     // GPU bytes one token of context costs, for a given cache type.
     static uint64_t bytes_per_token(const ModelDesc &d, bool kv8);
     ~GpuModel();
@@ -64,11 +67,13 @@ class GpuModel {
     Matrix load_matrix(const TensorInfo *w, const TensorInfo *bias = nullptr);
     Buffer load_vector(const TensorInfo *t);
     Buffer scratch(uint64_t n_floats);
-    Vec scratch_vec(uint32_t n);
-    void blocksum(Program &p, const Vec &x);
-    void matvec(Program &p, const Matrix &m, const Vec &x, const Buffer &y);
-    void build_program();
-    void eval_one(int32_t token);
+    Vec scratch_vec(uint64_t n);
+    void blocksum(Program &p, const Vec &x, uint32_t n);
+    // y[t] = M x[t] for the first n_tokens vectors of x; y holds vectors of m.n_out elements.
+    void matmul(Program &p, const Matrix &m, const Vec &x, const Buffer &y, uint32_t n_tokens);
+    void alloc_activations();
+    Program &program(int n_tokens);
+    void eval_batch(const int32_t *tokens, int n);
 
     Device &dev_;
     const GGUF &g_;
@@ -82,7 +87,11 @@ class GpuModel {
     std::vector<std::pair<uint32_t, Buffer>> tables_;   // codebooks, by tensor type
     uint32_t stride_ = 0, kv_words_ = 0;   // cache plane stride (positions, padded) and words per head per position
     std::vector<Buffer> zero_on_reset_;
-    std::unique_ptr<Program> program_;
+    // Activations for up to batch_cap_ tokens (one vector per token, consecutive).
+    struct Act { Buffer x, a, g, u, qfull, kraw, vraw, q, gate, scores, zsum, part, mixed, z, alpha, beta, qkv, dn_o, logits; Vec h, act, mix, dn_on, h_last; } act_;
+    int batch_ = 1, batch_cap_ = 8, q_batch_ = 1;   // tokens per batch; allocated capacity; queries scored together
+    uint32_t part_stride_ = 0;
+    std::map<int, std::unique_ptr<Program>> programs_;   // by number of tokens
     std::vector<float> logits_;
     uint64_t weight_bytes_ = 0, state_bytes_ = 0;
 };

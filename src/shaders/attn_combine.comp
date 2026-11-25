@@ -9,14 +9,14 @@ layout(binding = 1) readonly buffer BZ { float z[]; };
 layout(binding = 2) readonly buffer BGT { float gate[]; };
 layout(binding = 3) readonly buffer BCTL { uint pos; } ctl;
 layout(binding = 4) writeonly buffer BMIX { float mix[]; };
-layout(push_constant) uniform PC { uint hd; uint nh; uint seg; uint flags; } pc;
+layout(push_constant) uniform PC { uint hd; uint nh; uint seg; uint flags; uint part_stride; uint tq0; } pc;
 
 void main() {
-    uint h = gl_WorkGroupID.x, d = gl_LocalInvocationID.x;
-    uint n_seg = ctl.pos / pc.seg + 1u;
+    uint h = gl_WorkGroupID.x, lq = gl_WorkGroupID.y, tq = pc.tq0 + lq, d = gl_LocalInvocationID.x;
+    uint n_seg = (ctl.pos + tq) / pc.seg + 1u, o = (tq * pc.nh + h) * pc.hd + d;
     float acc = 0.0;
-    for (uint sg = 0u; sg < n_seg; sg++) acc += part[(sg * pc.nh + h) * pc.hd + d];
-    acc *= z[h];
-    if ((pc.flags & 1u) != 0u) acc *= sigmoid(gate[h * pc.hd + d]);
-    mix[h * pc.hd + d] = acc;
+    for (uint sg = 0u; sg < n_seg; sg++) acc += part[lq * pc.part_stride + (sg * pc.nh + h) * pc.hd + d];
+    acc *= z[tq * pc.nh + h];
+    if ((pc.flags & 1u) != 0u) acc *= sigmoid(gate[o]);
+    mix[o] = acc;
 }

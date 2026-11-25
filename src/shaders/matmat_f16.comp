@@ -1,0 +1,25 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Batched form of matvec_f16: T tokens per workgroup (gl_WorkGroupID.y selects the tile).
+#include "common.glsl"
+layout(local_size_x = 64) in;
+#define T 4u
+layout(binding = 0) readonly buffer BW { float16_t w[]; };
+layout(binding = 1) readonly buffer BX { float x[]; };
+layout(binding = 2) writeonly buffer BY { float y[]; };
+layout(binding = 3) readonly buffer BB { float bias[]; };
+layout(push_constant) uniform PC { uint n_in; uint n_rows; uint row0; uint flags; uint n_tokens; uint y_stride; } pc;
+
+void main() {
+    uint r = gl_GlobalInvocationID.x, t0 = gl_WorkGroupID.y * T;
+    if (r >= pc.n_rows) return;
+    uint base = r * pc.n_in;
+    float acc[T];
+    for (uint t = 0u; t < T; t++) acc[t] = 0.0;
+    for (uint i = 0u; i < pc.n_in; i++) {
+        float wv = float(w[base + i]);
+        for (uint t = 0u; t < T; t++) acc[t] += wv * x[(t0 + t) * pc.n_in + i];
+    }
+    for (uint t = 0u; t < T; t++)
+        if (t0 + t < pc.n_tokens) y[(t0 + t) * pc.y_stride + pc.row0 + r] = acc[t] + ((pc.flags & 1u) != 0u ? bias[pc.row0 + r] : 0.0);
+}

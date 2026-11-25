@@ -11,7 +11,7 @@ layout(binding = 0) readonly buffer BVC { uint vc[]; };
 layout(binding = 1) readonly buffer BSC { float sc[]; };    // exp(score - max), [query head][n_ctx]
 layout(binding = 2) readonly buffer BCTL { uint pos; } ctl;
 layout(binding = 3) writeonly buffer BP { float part[]; };  // [segment][query head][hd]
-layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint n_ctx; uint seg; } pc;
+layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint n_ctx; uint seg; uint part_stride; uint tq0; } pc;
 #ifdef KV8
 #define VPW 4u       // values per word
 #else
@@ -19,8 +19,8 @@ layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint n_ctx; uint 
 #endif
 
 void main() {
-    uint sg = gl_WorkGroupID.x, kvh = gl_WorkGroupID.y, w = gl_LocalInvocationID.x;
-    uint t0 = sg * pc.seg, t1 = min(ctl.pos + 1u, t0 + pc.seg);
+    uint sg = gl_WorkGroupID.x, kvh = gl_WorkGroupID.y, lq = gl_WorkGroupID.z, tq = pc.tq0 + lq, w = gl_LocalInvocationID.x;
+    uint t0 = sg * pc.seg, t1 = min(ctl.pos + tq + 1u, t0 + pc.seg), sb = (lq * pc.nh + kvh * G) * pc.n_ctx;
     float acc[G * VPW];
     for (uint i = 0u; i < G * VPW; i++) acc[i] = 0.0;
 #ifdef KV8
@@ -31,7 +31,7 @@ void main() {
         float bs = unpackHalf2x16(vc[rb + pc.hd / 4u + (w >> 4)])[(w >> 3) & 1u];
         vec4 v = vec4(float(bitfieldExtract(wv, 0, 8)), float(bitfieldExtract(wv, 8, 8)), float(bitfieldExtract(wv, 16, 8)), float(wv >> 24)) * bs;
         for (uint g = 0u; g < G; g++) {
-            float p = sc[(kvh * G + g) * pc.n_ctx + t];
+            float p = sc[sb + g * pc.n_ctx + t];
             acc[g * 4u] += p * v.x; acc[g * 4u + 1u] += p * v.y; acc[g * 4u + 2u] += p * v.z; acc[g * 4u + 3u] += p * v.w;
         }
     }
@@ -40,11 +40,11 @@ void main() {
     for (uint t = t0; t < t1; t++) {
         vec2 v = unpackHalf2x16(vc[t * rv + kvh * pk + w]);
         for (uint g = 0u; g < G; g++) {
-            float p = sc[(kvh * G + g) * pc.n_ctx + t];
+            float p = sc[sb + g * pc.n_ctx + t];
             acc[g * 2u] += p * v.x; acc[g * 2u + 1u] += p * v.y;
         }
     }
 #endif
     for (uint g = 0u; g < G; g++)
-        for (uint i = 0u; i < VPW; i++) part[(sg * pc.nh + kvh * G + g) * pc.hd + w * VPW + i] = acc[g * VPW + i];
+        for (uint i = 0u; i < VPW; i++) part[lq * pc.part_stride + (sg * pc.nh + kvh * G + g) * pc.hd + w * VPW + i] = acc[g * VPW + i];
 }
