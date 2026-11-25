@@ -40,6 +40,7 @@ uint64_t GpuModel::bytes_per_token(const ModelDesc &d, bool kv8) {
 
 GpuModel::GpuModel(Device &dev, const GGUF &g, const ModelDesc &desc, int n_ctx, bool force_fp16, bool kv8, uint64_t reserve_bytes, int batch) : dev_(dev), g_(g), d_(desc), n_ctx_(n_ctx), force_fp16_(force_fp16), kv8_(kv8) {
     // Batching addresses per-token vectors inside shared buffers, which needs aligned vector sizes.
+    if (d_.n_embd % 16 || d_.n_ff % 16 || d_.head_dim % 16 || (d_.dn_head_dim % 16)) throw std::runtime_error("vector sizes that are not multiples of 16 are not supported");
     bool can_batch = d_.n_embd % 64 == 0 && d_.n_ff % 16 == 0 && (d_.n_head * d_.head_dim) % 16 == 0 && (d_.dn_v_heads * d_.dn_head_dim) % 16 == 0;
     batch_ = can_batch ? std::max(1, std::min(batch, 256)) : 1;
     batch_cap_ = (batch_ + (int)k_tile - 1) / (int)k_tile * (int)k_tile;
@@ -214,11 +215,6 @@ void GpuModel::alloc_activations() {
     a.logits = scratch(d_.n_vocab);
 }
 
-void GpuModel::blocksum(Program &p, const Vec &x, uint32_t n) {
-    uint32_t nb = (n + 15) / 16;
-    p.dispatch(dev_.pipeline("blocksum"), {R(x.v), W(x.s)}, &nb, sizeof nb, (nb + 63) / 64);
-}
-
 void GpuModel::matmul(Program &p, const Matrix &m, const Vec &x, const Buffer &y, uint32_t n_tokens) {
     const Buffer &bias = m.bias.valid() ? m.bias : dummy_;
     const bool batched = n_tokens > 1;
@@ -273,13 +269,14 @@ Program &GpuModel::program(int n_tokens) {
     slot = std::make_unique<Program>(dev_);
     Program &p = *slot;
     p.copy(embd_.sub(0, 4ull * N * n), a.x.sub(0, 4ull * N * n));
-    auto norm = [&](const Buffer &xin, const Buffer &add, const Buffer &w, const Buffer &gt, const Buffer &y, uint32_t len, uint32_t groups) {
-        PcNorm pc{len, (add.valid() ? 1u : 0u) | (gt.valid() ? 2u : 0u), d_.norm_eps};
-        p.dispatch(p_norm, {W(xin), R(add.valid() ? add : dummy_), R(w), R(gt.valid() ? gt : dummy_), W(y)}, &pc, sizeof pc, groups);
+    // Normalise `groups` spans of `len` elements into y, with its 16-element block sums.
+    auto norm = [&](const Buffer &xin, const Buffer &add, const Buffer &w, const Buffer &gt, const Vec &y, uint32_t len, uint32_t groups) {
+        PcNorm pc{len, (add.valid() ? 1u : 0u) | (gt.valid() ? 2u : 0u) | 4u, d_.norm_eps};
+        p.dispatch(p_norm, {W(xin), R(add.valid() ? add : dummy_), R(w), R(gt.valid() ? gt : dummy_), W(y.v), W(y.s)}, &pc, sizeof pc, groups);
     };
     for (int il = 0; il < d_.n_layer; il++) {
         Layer &l = layers_[il];
-        norm(a.x, il > 0 ? a.a : Buffer{}, l.attn_norm, Buffer{}, a.h.v, n, N); blocksum(p, a.h, N * n);
+        norm(a.x, il > 0 ? a.a : Buffer{}, l.attn_norm, Buffer{}, a.h, n, N);
         if (l.recurrent) {
             matmul(p, l.wqkv, a.h, a.mixed, N); matmul(p, l.wz, a.h, a.z, N); matmul(p, l.wbeta, a.h, a.beta, N); matmul(p, l.walpha, a.h, a.alpha, N);
             PcDnPrep pp{(uint32_t)(2 * HK), (uint32_t)d_.dn_conv, d_.norm_eps, (uint32_t)C};
@@ -288,7 +285,7 @@ Program &GpuModel::program(int n_tokens) {
             p.dispatch(p_dn_hist, {R(a.mixed), W(l.hist)}, &ph, sizeof ph, (C + 63) / 64);
             PcDnUpdate pu{(uint32_t)HK, (uint32_t)S, N, (uint32_t)HV, (uint32_t)C};
             p.dispatch(p_dn_update, {R(a.qkv), R(a.alpha), R(a.beta), R(l.dt), R(l.a), W(l.state), W(a.dn_o)}, &pu, sizeof pu, HV);
-            norm(a.dn_o, Buffer{}, l.ssm_norm, a.z, a.dn_on.v, S, N * HV); blocksum(p, a.dn_on, N * HV * S);
+            norm(a.dn_o, Buffer{}, l.ssm_norm, a.z, a.dn_on, S, N * HV);
             matmul(p, l.ssm_out, a.dn_on, a.a, N);
         } else {
             matmul(p, l.wq, a.h, a.qfull, N); matmul(p, l.wk, a.h, a.kraw, N); matmul(p, l.wv, a.h, a.vraw, N);
@@ -305,21 +302,19 @@ Program &GpuModel::program(int n_tokens) {
                 PcVsum pv{(uint32_t)hd, (uint32_t)nh, (uint32_t)nkv, stride_, k_seg, part_stride_, q0};
                 p.dispatch_indirect(p_vsum, {R(l.vc), R(a.scores), R(ctl_), W(a.part)}, &pv, sizeof pv, ind_.sub(32ull * sub + 16, 12));
                 PcCombine pcb{(uint32_t)hd, (uint32_t)nh, k_seg, d_.q_has_gate ? 1u : 0u, part_stride_, q0};
-                p.dispatch(p_combine, {R(a.part), R(a.zsum), R(a.gate), R(ctl_), W(a.mix.v)}, &pcb, sizeof pcb, nh, nb);
+                p.dispatch(p_combine, {R(a.part), R(a.zsum), R(a.gate), R(ctl_), W(a.mix.v), W(a.mix.s)}, &pcb, sizeof pcb, nh, nb);
             }
-            blocksum(p, a.mix, N * nh * hd);
             matmul(p, l.wo, a.mix, a.a, N);
         }
-        norm(a.x, a.a, l.ffn_norm, Buffer{}, a.h.v, n, N); blocksum(p, a.h, N * n);
+        norm(a.x, a.a, l.ffn_norm, Buffer{}, a.h, n, N);
         matmul(p, l.ffn_gate, a.h, a.g, N); matmul(p, l.ffn_up, a.h, a.u, N);
         uint32_t nff = N * d_.n_ff;
-        p.dispatch(p_swiglu, {R(a.g), R(a.u), W(a.act.v)}, &nff, sizeof nff, (nff + 63) / 64);
-        blocksum(p, a.act, nff);
+        p.dispatch(p_swiglu, {R(a.g), R(a.u), W(a.act.v), W(a.act.s)}, &nff, sizeof nff, (nff / 16 + 63) / 64);
         matmul(p, l.ffn_down, a.act, a.a, N);
     }
     // Only the last token's logits are needed.
     const uint64_t last = 4ull * (N - 1) * n;
-    norm(a.x.sub(last, 4ull * n), a.a.sub(last, 4ull * n), output_norm_, Buffer{}, a.h_last.v, n, 1); blocksum(p, a.h_last, n);
+    norm(a.x.sub(last, 4ull * n), a.a.sub(last, 4ull * n), output_norm_, Buffer{}, a.h_last, n, 1);
     matmul(p, output_, a.h_last, a.logits, 1);
     p.copy(a.logits, logits_host_);
     p.finish();

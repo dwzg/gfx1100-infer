@@ -1,7 +1,8 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 // Finish attention for one query head (one workgroup per head, one lane per dimension): add the
-// per-segment sums, normalise by the softmax sum, apply the optional sigmoid gate.
+// per-segment sums, normalise by the softmax sum, apply the optional sigmoid gate. Also writes the
+// sums over blocks of 16 dimensions that the following matrix product consumes.
 #include "common.glsl"
 layout(local_size_x_id = 0) in;   // = head_dim
 layout(binding = 0) readonly buffer BP { float part[]; };
@@ -9,6 +10,8 @@ layout(binding = 1) readonly buffer BZ { float z[]; };
 layout(binding = 2) readonly buffer BGT { float gate[]; };
 layout(binding = 3) readonly buffer BCTL { uint pos; } ctl;
 layout(binding = 4) writeonly buffer BMIX { float mix[]; };
+layout(binding = 5) writeonly buffer BMS { float mixs[]; };
+shared float sv[gl_WorkGroupSize.x];
 layout(push_constant) uniform PC { uint hd; uint nh; uint seg; uint flags; uint part_stride; uint tq0; } pc;
 
 void main() {
@@ -19,4 +22,7 @@ void main() {
     acc *= z[tq * pc.nh + h];
     if ((pc.flags & 1u) != 0u) acc *= sigmoid(gate[o]);
     mix[o] = acc;
+    sv[d] = acc;
+    barrier();
+    if ((d & 15u) == 0u) { float t = 0.0; for (uint i = 0u; i < 16u; i++) t += sv[d + i]; mixs[o >> 4] = t; }
 }

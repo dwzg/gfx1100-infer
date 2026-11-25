@@ -2,6 +2,8 @@
 #extension GL_GOOGLE_include_directive : require
 // RMS normalisation of `groups` spans of n elements, one workgroup per span:
 //   x += a (flag 1, written back);  y = x / sqrt(mean(x^2) + eps) * w;  y *= silu(gate) (flag 2)
+// Also writes the sums of y over blocks of 16 elements (flag 4; needs n % 16 == 0), which the
+// quantised matrix kernels consume. Each lane handles whole 16-element blocks.
 #include "common.glsl"
 layout(local_size_x = 256) in;
 layout(binding = 0) buffer BX { float x[]; };
@@ -9,18 +11,20 @@ layout(binding = 1) readonly buffer BA { float a[]; };
 layout(binding = 2) readonly buffer BW { float w[]; };
 layout(binding = 3) readonly buffer BG { float gate[]; };
 layout(binding = 4) writeonly buffer BY { float y[]; };
+layout(binding = 5) writeonly buffer BYS { float ys[]; };
 layout(push_constant) uniform PC { uint n; uint flags; float eps; } pc;
 shared float part[256];
 
 void main() {
     uint lid = gl_LocalInvocationID.x, base = gl_WorkGroupID.x * pc.n;
-    bool add = (pc.flags & 1u) != 0u, gated = (pc.flags & 2u) != 0u;
+    bool add = (pc.flags & 1u) != 0u, gated = (pc.flags & 2u) != 0u, sums = (pc.flags & 4u) != 0u;
     float ss = 0.0;
-    for (uint i = lid; i < pc.n; i += 256u) {
-        float v = x[base + i];
-        if (add) { v += a[base + i]; x[base + i] = v; }
-        ss += v * v;
-    }
+    for (uint b = 16u * lid; b < pc.n; b += 4096u)
+        for (uint i = b; i < min(b + 16u, pc.n); i++) {
+            float v = x[base + i];
+            if (add) { v += a[base + i]; x[base + i] = v; }
+            ss += v * v;
+        }
     part[lid] = ss;
     barrier();
     for (uint s = 128u; s > 0u; s >>= 1u) {
@@ -28,9 +32,14 @@ void main() {
         barrier();
     }
     float scale = inversesqrt(part[0] / float(pc.n) + pc.eps);
-    for (uint i = lid; i < pc.n; i += 256u) {
-        float v = x[base + i] * scale * w[i];
-        if (gated) v *= silu(gate[base + i]);
-        y[base + i] = v;
+    for (uint b = 16u * lid; b < pc.n; b += 4096u) {
+        float bsum = 0.0;
+        for (uint i = b; i < min(b + 16u, pc.n); i++) {
+            float v = x[base + i] * scale * w[i];
+            if (gated) v *= silu(gate[base + i]);
+            y[base + i] = v;
+            bsum += v;
+        }
+        if (sums) ys[(base + b) >> 4] = bsum;
     }
 }

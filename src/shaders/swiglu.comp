@@ -1,13 +1,17 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// act = silu(g) * u
+// act = silu(g) * u, plus the sums of act over blocks of 16 elements. One lane per block.
 #include "common.glsl"
 layout(local_size_x = 64) in;
 layout(binding = 0) readonly buffer BG { float g[]; };
 layout(binding = 1) readonly buffer BU { float u[]; };
 layout(binding = 2) writeonly buffer BY { float y[]; };
+layout(binding = 3) writeonly buffer BYS { float ys[]; };
 layout(push_constant) uniform PC { uint n; } pc;
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i < pc.n) y[i] = silu(g[i]) * u[i];
+    uint b = 16u * gl_GlobalInvocationID.x;
+    if (b >= pc.n) return;
+    float bsum = 0.0;
+    for (uint i = b; i < min(b + 16u, pc.n); i++) { float v = silu(g[i]) * u[i]; y[i] = v; bsum += v; }
+    ys[b >> 4] = bsum;
 }

@@ -68,7 +68,6 @@ class GpuModel {
     Buffer load_vector(const TensorInfo *t);
     Buffer scratch(uint64_t n_floats);
     Vec scratch_vec(uint64_t n);
-    void blocksum(Program &p, const Vec &x, uint32_t n);
     // y[t] = M x[t] for the first n_tokens vectors of x; y holds vectors of m.n_out elements.
     void matmul(Program &p, const Matrix &m, const Vec &x, const Buffer &y, uint32_t n_tokens);
     void alloc_activations();
