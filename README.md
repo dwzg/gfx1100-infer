@@ -19,10 +19,11 @@ Nothing in this repository is a measured 7900 XTX speed.
 | Llama-style models (`llama`, `qwen2`, `qwen3`) | Runs on the GPU path; matches the CPU reference |
 | Weight formats with a native GPU layout | Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, NVFP4 |
 | Other weight formats (Q2_K, Q4_1, Q5_0, Q5_1, F16, F32; MXFP4 and BF16 untested) | Stored as half precision on the GPU |
+| Inkling's expert matrices | NVFP4 and Q5_K (what its `UD-Q4_K_M` file uses) and the other formats without a codebook table; all 128 experts of a layer share one buffer |
 | Tokenizer | Byte-pair vocabularies with the `qwen35`, `qwen2`, `llama3`, `inkling2`/`gpt-4o`, `smollm`, `gpt-2` rules |
 | Attention cache | Half precision, or 8-bit with `--kv8`; context sized automatically with `--ctx max` |
 | Saving and restoring a processed context | `--save-state` / `--load-state` |
-| Inkling 2 Mini (`inkling2_loop`) | **CPU reference only** (`--device cpu`, about 1.5 s per token): the whole graph is implemented and writes coherent text. No GPU path yet |
+| Inkling 2 Mini (`inkling2_loop`) | Runs on the GPU path and matches its CPU reference; served to Claude Code in its own message format. Tested on the CPU driver with only the experts a test needs uploaded (the whole model needs 15 GiB of device memory) |
 | Batched prompt processing | Yes: prompt tokens go through in batches (default 32) with weights decoded once per 4-token tile |
 | Matrix instructions (WMMA) for prompts | Written and compiled for the card, **never executed**; enabled per weight format only if an automatic on-device check passes |
 | Interactive chat | `gfxi chat`, ChatML-style templates only, with `--system` and `--no-think` |
@@ -154,6 +155,11 @@ token of context costs, and how much the desktop is already using.
 So `UD-Q4_K_S` with `--kv8` reaches the model's full 262,144 tokens on a card that also drives a
 desktop. Going past 262,144 would need YaRN position scaling, which is not implemented.
 
+Inkling 2 Mini (`UD-Q4_K_M`, 15.0 GiB of weights on the GPU) keeps a context-length cache in only
+8 of its 48 cache slots; the other 40 keep a 1,024-token sliding window. Its cache therefore costs
+32.0 KiB per token at half precision and 17.0 KiB at 8 bits, and with the same 1.5 GiB left for
+the desktop `gfxi plan` gives **228,607 tokens (half precision) or 435,120 tokens (8-bit)**.
+
 Two things to know before relying on a very long context:
 
 - **Filling it takes a while.** Prompts are processed in batches, but how fast that is on the real
@@ -205,6 +211,21 @@ weight exactly once per token, as cheaply as possible:
   is ever moved. The linear-attention state lives outside the cache and is copied to main memory
   where a conversation may later be resumed (`src/engine/context.h`).
 
+**Inkling 2** (`src/core/inkling.h` describes the architecture) adds, on top of the above:
+
+- *Experts picked on the GPU.* A layer's 128 experts sit in one buffer, each in the plane-major
+  layout. A small kernel routes each token (sigmoid gate, top 8), and the matrix kernels get an
+  "expert" mode that reads the chosen expert's index and offsets every weight load by it, so a
+  token touches only the 8 experts it uses and nothing is copied or selected on the CPU.
+- *Two kinds of cache.* Layers that attend to everything use the paged cache; the others use a
+  ring of 1,024 positions plus one batch, addressed by position modulo its size. The rings and the
+  convolution history are small and travel with a conversation like the linear-attention state.
+- *Position bias and sinks in the score kernel.* A table of bias by distance is computed per query
+  head once per token; the score kernel adds its entry for each position's distance, and the
+  softmax kernel adds the sink's term.
+- *The loop is unrolled when the forward pass is recorded*: 48 slot executions, about 2,000
+  dispatches per token. Nothing here is fused yet; that is tuning for the real card.
+
 **Correctness first.** `src/core/ref.cpp` is a plain scalar implementation of the forward pass.
 The GPU engine is checked against it logit by logit, and it is itself checked by generating
 coherent text on real models.
@@ -224,12 +245,15 @@ What was checked, and how:
 | Batched prompts (batch sizes 1, 5, 7, 32; forced query sub-batches), all 12 model files | CPU reference | Same results as token-by-token |
 | Batched and emulated matrix-path kernels, all 14 native formats, on real weight samples | Scalar decoder | Relative error about 3e-7 (batched) and 3e-4 (half-precision matrix path) |
 | 8-bit cache | CPU reference | Relative logit error 0.4-0.9% on Qwen 3.5 0.8B; 1-2% on a 135M Llama-style model |
-| Every kernel compiles for the 7900 XTX, including the matrix-instruction ones | RADV 25.2.8 as Navi 31 (no hardware) | All 74 compile, no vector-register spills; the matrix kernels contain `v_wmma_f32_16x16x16_f16` |
+| Every kernel compiles for the 7900 XTX, including the matrix-instruction and Inkling ones | RADV 25.2.8 as Navi 31 (no hardware) | All 107 compile, none spills vector registers; the batched kernels of seven formats spill 27-38 scalar registers (to tune on the card); the matrix kernels contain `v_wmma_f32_16x16x16_f16` |
 | Paged cache with small pages handed out in reverse order, half-precision and 8-bit | CPU reference | Same errors as unpaged |
 | Conversation cache: continuing, branching, returning, same prompt again, eviction (Qwen 3.5 with both cache types, Qwen 3) | Processing the same prompt from scratch | Bit-identical logits |
 | Prompt formatting: 86 prompts with system text, tools, calls, results, reasoning and effort levels, on the templates of Qwen 3.8, 3.5, 3, 2.5 and SmolLM2 | The model's own template, run with jinja2 | Byte-identical |
 | Reply parser: 14 replies, each fed in pieces of 1, 2, 3, 7, 64 bytes and whole | Expected blocks; events add up to the blocks; parsed and written back gives the original text | All pass |
 | Server protocol: streaming, forced tool call, tool result, reuse across turns and across a side request, cancel, stop sequence, errors | Official `anthropic` Python SDK 2.14 as the client | All pass; a follow-up turn reused 432 of 432 earlier tokens |
+| Inkling 2 Mini, CPU reference | The text it writes | Coherent reasoning and a correct answer ("Capital of France is Paris ... `s[::-1]`") |
+| Inkling 2 Mini, GPU engine: token by token, prompts in batches of 8, 8-bit cache, and a start at position 9,000 (ring wrap-around, distances past the bias table, position scaling) | Its CPU reference | Relative logit error 7e-5 (half precision), 4e-4 at position 9,000, 1.8e-2 (8-bit); same top token throughout |
+| Inkling prompt formatting (32 prompts) and reply parsing (6 cases at every piece size) | Its own template run with jinja2; expected blocks | Byte-identical; all pass |
 | Claude Code itself: CLI 2.1.332 with its default system prompt and 13 tools (12,453 prompt tokens), asked to read a file and report a value from it; Qwen 3.5 0.8B on the CPU driver | The right answer | Called its Read tool, then answered correctly; the second request reused 12,558 of 12,587 prompt tokens |
 
 Not checked:
@@ -250,8 +274,13 @@ Not checked:
   In particular the 8-bit cache's effect on the 27B model's answers at long context is unknown.
 - **A genuinely full long context.** Position 120,000 was tested over an empty cache, which checks
   the indexing but not a real 100K-token document.
-- **IQ4_XS, the IQ2/IQ3 formats and NVFP4 end to end.** No small test model uses them; they have
-  decoder and kernel tests only.
+- **IQ4_XS and the IQ2/IQ3 formats end to end.** No small test model uses them; they have
+  decoder and kernel tests only. (NVFP4 and Q5_K are now covered end to end by Inkling.)
+- **Inkling 2 Mini as a whole on one device.** The development machine has 15 GiB of memory and
+  the model needs 15 GiB on the device, so the GPU tests uploaded only the experts each test used
+  (the CPU reference says which) and were short: at most 19 tokens. Long prompts, the server with
+  Inkling, and Claude Code with Inkling have not run. Its correctness rests on the CPU reference,
+  which was checked only by the text it writes, not against another implementation.
 
 Run the suite with `tests/run_tests.sh <models-dir> [python]`.
 
@@ -272,12 +301,15 @@ In order:
 4. Claude Code against the real model: `gfxi serve` with Qwen 3.8 27B, then a session with the
    settings it prints. Watch the server's log lines (tokens reused, processed, tokens per second)
    and how well the model handles Claude Code's tool calls.
-5. The Inkling 2 Mini architecture.
+5. Inkling 2 Mini: `gfxi compare Inkling-2-Mini-UD-Q4_K_M.gguf` (GPU against the CPU reference,
+   this time with every expert on the device), then `gfxi bench` and `gfxi serve` with it. Its
+   forward pass is about 2,000 small dispatches per token, so expect dispatch overhead rather than
+   memory bandwidth to set its speed until kernels are fused.
 
 ## Layout
 
 ```
-src/core/     GGUF reader, weight decoders, tokenizer, model description, CPU reference, sampler
+src/core/     GGUF reader, weight decoders, tokenizer, model descriptions, CPU references (ref.cpp, inkling.cpp), sampler
 src/vk/       Vulkan device, memory, pipelines, recorded programs
 src/engine/   GPU weight layouts, the GPU engine, the conversation cache
 src/shaders/  compute kernels (GLSL)
