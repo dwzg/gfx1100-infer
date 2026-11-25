@@ -1,0 +1,34 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Gated delta-net state update and read-out. One workgroup per value head; one lane per value
+// dimension j. The state is stored as [head][i][j] so that lanes read adjacent memory.
+//   T[i][j] <- decay * T[i][j] + delta_j * k[i],   delta_j = (v[j] - sum_i decay*T[i][j]*k[i]) * beta
+//   out[j]   = sum_i T[i][j] * q[i] / sqrt(S)
+#include "common.glsl"
+layout(local_size_x_id = 0) in;   // = head_dim
+layout(binding = 0) readonly buffer BQKV { float qkv[]; };   // q heads, k heads, v heads
+layout(binding = 1) readonly buffer BAL { float alpha[]; };
+layout(binding = 2) readonly buffer BBE { float beta[]; };
+layout(binding = 3) readonly buffer BDT { float dt[]; };
+layout(binding = 4) readonly buffer BA { float a[]; };
+layout(binding = 5) buffer BS { float st[]; };
+layout(binding = 6) writeonly buffer BO { float o[]; };
+layout(push_constant) uniform PC { uint hk; } pc;
+
+void main() {
+    uint hv = gl_WorkGroupID.x, j = gl_LocalInvocationID.x, S = gl_WorkGroupSize.x;
+    uint kh = hv % pc.hk, qb = kh * S, kb = pc.hk * S + kh * S, vb = 2u * pc.hk * S + hv * S, sb = hv * S * S;
+    float decay = exp(softplus(alpha[hv] + dt[hv]) * a[hv]);
+    float b = sigmoid(beta[hv]);
+    float ak = 0.0, aq = 0.0, kq = 0.0;
+    for (uint i = 0u; i < S; i++) {
+        float m = st[sb + i * S + j] * decay, ki = qkv[kb + i], qi = qkv[qb + i];
+        ak += m * ki; aq += m * qi; kq += ki * qi;
+    }
+    float delta = (qkv[vb + j] - ak) * b;
+    for (uint i = 0u; i < S; i++) {
+        uint idx = sb + i * S + j;
+        st[idx] = st[idx] * decay + delta * qkv[kb + i];
+    }
+    o[hv * S + j] = (aq + delta * kq) * inversesqrt(float(S));
+}

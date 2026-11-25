@@ -1,0 +1,30 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Linear-attention input stage. One workgroup per head-sized block of channels, one lane per channel:
+// causal depthwise convolution over the last KW projections, SiLU, and L2 normalisation of the
+// query and key blocks (the first n_norm blocks).
+#include "common.glsl"
+layout(local_size_x_id = 0) in;   // = head_dim
+layout(binding = 0) readonly buffer BM { float mixed[]; };
+layout(binding = 1) buffer BH { float hist[]; };            // [channel][KW-1], oldest first
+layout(binding = 2) readonly buffer BCW { float cw[]; };     // [channel][KW]
+layout(binding = 3) writeonly buffer BO { float o[]; };
+layout(push_constant) uniform PC { uint n_norm; uint kw; float eps; } pc;
+shared float red[gl_WorkGroupSize.x];
+
+void main() {
+    uint blk = gl_WorkGroupID.x, lid = gl_LocalInvocationID.x, S = gl_WorkGroupSize.x;
+    uint c = blk * S + lid, hw = pc.kw - 1u;
+    float cur = mixed[c];
+    float s = cur * cw[c * pc.kw + hw];
+    for (uint i = 0u; i < hw; i++) s += hist[c * hw + i] * cw[c * pc.kw + i];
+    for (uint i = 0u; i + 1u < hw; i++) hist[c * hw + i] = hist[c * hw + i + 1u];
+    hist[c * hw + hw - 1u] = cur;
+    float v = silu(s);
+    red[lid] = v * v;
+    barrier();
+    if (lid == 0u) { float t = 0.0; for (uint i = 0u; i < S; i++) t += red[i]; red[0] = t; }
+    barrier();
+    if (blk < pc.n_norm) v *= inversesqrt(red[0] + pc.eps);
+    o[c] = v;
+}

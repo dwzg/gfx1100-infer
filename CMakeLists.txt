@@ -7,7 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 option(GFX_NATIVE "Optimise the CPU code for this machine" ON)
 if(GFX_NATIVE)
   add_compile_options(-march=native)
@@ -26,5 +26,22 @@ add_library(gfxcore STATIC
 target_include_directories(gfxcore PUBLIC src)
 target_link_libraries(gfxcore PUBLIC Threads::Threads)
 
+find_package(Vulkan REQUIRED)
+include(cmake/shaders.cmake)
+gfx_shader(matvec_f16 matvec_f16.comp)
+gfx_shader(norm norm.comp)
+gfx_shader(swiglu swiglu.comp)
+gfx_shader(attn_prep attn_prep.comp)
+gfx_shader(attn attn.comp)
+gfx_shader(dn_prep dn_prep.comp)
+gfx_shader(dn_update dn_update.comp)
+gfx_shaders_finish()
+
+add_library(gfxgpu STATIC
+  src/engine/gpu_model.cpp
+  src/vk/vk.cpp
+  src/vk/shaders.cpp)
+target_link_libraries(gfxgpu PUBLIC gfxcore gfxshaders Vulkan::Vulkan)
+
 add_executable(gfxi src/tools/main.cpp)
-target_link_libraries(gfxi PRIVATE gfxcore)
+target_link_libraries(gfxi PRIVATE gfxgpu)

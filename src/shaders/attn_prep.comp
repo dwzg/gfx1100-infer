@@ -1,0 +1,61 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Prepare one token for full attention. One workgroup per head, one lane per head dimension:
+//   query:  split off the output gate, RMS-normalise, rotate by position -> q, gate
+//   key:    RMS-normalise, rotate by position -> key cache row `pos`
+//   value:  -> value cache row `pos`
+#include "common.glsl"
+layout(local_size_x_id = 0) in;   // = head_dim
+layout(binding = 0) readonly buffer BQF { float qfull[]; };
+layout(binding = 1) readonly buffer BKR { float kraw[]; };
+layout(binding = 2) readonly buffer BVR { float vraw[]; };
+layout(binding = 3) readonly buffer BNW { float nw[]; };       // q-norm weight, then k-norm weight
+layout(binding = 4) readonly buffer BCTL { uint pos; uint pad[3]; float rot[]; } ctl;  // rot: cos, sin per pair
+layout(binding = 5) writeonly buffer BQ { float q[]; };
+layout(binding = 6) writeonly buffer BGT { float gate[]; };
+layout(binding = 7) writeonly buffer BKC { float16_t kc[]; };
+layout(binding = 8) writeonly buffer BVC { float16_t vc[]; };
+layout(push_constant) uniform PC { uint hd; uint nh; uint nkv; uint qw; uint rope_dim; uint flags; float eps; } pc;
+// flags: 1 = normalise q and k, 2 = q carries a gate, 4 = rotation pairs are (i, i + rope_dim/2)
+shared float sv[gl_WorkGroupSize.x];
+shared float red[gl_WorkGroupSize.x];
+
+// Normalise (optionally) and rotate this lane's element; all lanes of the workgroup call it together.
+float norm_rotate(float v, uint w_off) {
+    uint d = gl_LocalInvocationID.x;
+    red[d] = v * v;
+    barrier();
+    if (d == 0u) { float s = 0.0; for (uint i = 0u; i < pc.hd; i++) s += red[i]; red[0] = s; }
+    barrier();
+    if ((pc.flags & 1u) != 0u) v *= inversesqrt(red[0] / float(pc.hd) + pc.eps) * nw[w_off + d];
+    sv[d] = v;
+    barrier();
+    if (d < pc.rope_dim) {
+        uint hf = pc.rope_dim / 2u, pair, other; bool first;
+        if ((pc.flags & 4u) != 0u) { first = d < hf; pair = first ? d : d - hf; other = first ? d + hf : d - hf; }
+        else { first = (d & 1u) == 0u; pair = d >> 1u; other = d ^ 1u; }
+        float c = ctl.rot[2u * pair], s = ctl.rot[2u * pair + 1u];
+        float x0 = first ? v : sv[other], x1 = first ? sv[other] : v;
+        v = first ? x0 * c - x1 * s : x0 * s + x1 * c;
+    }
+    barrier();
+    return v;
+}
+
+void main() {
+    uint g = gl_WorkGroupID.x, d = gl_LocalInvocationID.x;
+    bool has_q = g < pc.nh, has_kv = g < pc.nkv;
+    float qv = has_q ? qfull[g * pc.qw + d] : 0.0;
+    qv = norm_rotate(qv, 0u);
+    if (has_q) {
+        q[g * pc.hd + d] = qv;
+        if ((pc.flags & 2u) != 0u) gate[g * pc.hd + d] = qfull[g * pc.qw + pc.hd + d];
+    }
+    float kv = has_kv ? kraw[g * pc.hd + d] : 0.0;
+    kv = norm_rotate(kv, pc.hd);
+    if (has_kv) {
+        uint row = ctl.pos * pc.nkv * pc.hd + g * pc.hd + d;
+        kc[row] = float16_t(kv);
+        vc[row] = float16_t(vraw[g * pc.hd + d]);
+    }
+}

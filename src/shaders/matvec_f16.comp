@@ -1,0 +1,29 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// y[row0 + r] = dot(W[r], x) (+ bias). W is half precision, one output row after another.
+// One lane per output row.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer BW { float16_t w[]; };
+layout(binding = 1) readonly buffer BX { float x[]; };
+layout(binding = 2) writeonly buffer BY { float y[]; };
+layout(binding = 3) readonly buffer BB { float bias[]; };
+layout(push_constant) uniform PC { uint n_in; uint n_rows; uint row0; uint flags; } pc;
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.n_rows) return;
+    uint base = r * pc.n_in;
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    uint i = 0u;
+    for (; i + 4u <= pc.n_in; i += 4u) {
+        a0 += float(w[base + i]) * x[i];
+        a1 += float(w[base + i + 1u]) * x[i + 1u];
+        a2 += float(w[base + i + 2u]) * x[i + 2u];
+        a3 += float(w[base + i + 3u]) * x[i + 3u];
+    }
+    for (; i < pc.n_in; i++) a0 += float(w[base + i]) * x[i];
+    float s = (a0 + a1) + (a2 + a3);
+    if ((pc.flags & 1u) != 0u) s += bias[pc.row0 + r];
+    y[pc.row0 + r] = s;
+}
